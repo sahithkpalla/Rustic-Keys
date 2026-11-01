@@ -19,7 +19,7 @@ use io_kit_sys::hid::device::IOHIDDeviceGetProperty;
 use io_kit_sys::hid::element::{IOHIDElementGetDevice, IOHIDElementGetUsage, IOHIDElementGetUsagePage};
 use io_kit_sys::hid::keys::kIOHIDOptionsTypeNone;
 use io_kit_sys::hid::manager::*;
-use io_kit_sys::hid::value::{IOHIDValueGetElement, IOHIDValueGetIntegerValue};
+use io_kit_sys::hid::value::{IOHIDValueGetElement, IOHIDValueGetIntegerValue, IOHIDValueGetTimeStamp};
 use io_kit_sys::ret::IOReturn;
 
 use super::{classify, is_key_usage, DeviceInfo, KeyAction, KeyEvent, KeySource};
@@ -98,7 +98,22 @@ unsafe extern "C" fn on_value(context: *mut c_void, _r: IOReturn, _s: *mut c_voi
         .entry(device as usize)
         .or_insert_with(|| classify(&device_info(device)));
     let action = if unsafe { IOHIDValueGetIntegerValue(value) } != 0 { KeyAction::Down } else { KeyAction::Up };
+    if std::env::var_os("RUSTIC_KEYS_TRACE").is_some() {
+        trace_delivery(unsafe { IOHIDValueGetTimeStamp(value) });
+    }
     let _ = c.tx.send(InputMsg::Key(KeyEvent { source, action, usage }));
+}
+
+/// Diagnostics: how long after the hardware event this callback ran.
+#[allow(deprecated)] // libc mach time fns; avoids an extra mach2 dependency
+fn trace_delivery(event_ticks: u64) {
+    let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+    let now = unsafe {
+        libc::mach_timebase_info(&mut tb);
+        libc::mach_absolute_time()
+    };
+    let ns = now.saturating_sub(event_ticks) as u128 * tb.numer as u128 / tb.denom.max(1) as u128;
+    eprintln!("[trace] HID delivery {:.2} ms", ns as f64 / 1e6);
 }
 
 /// Start the listener on its own thread with its own run loop. Returns once

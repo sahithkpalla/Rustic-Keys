@@ -30,6 +30,9 @@ fn demo(name: &str) -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(60));
     }
     std::thread::sleep(Duration::from_millis(400));
+    let (req, frames, lat) = out.latency_report();
+    println!("buffer requested {req}, {frames} frames/callback ({:.1} ms), callback→speaker {:.1} ms",
+        frames as f64 * 1000.0 / out.sample_rate() as f64, lat as f64 / 1000.0);
     Ok(())
 }
 

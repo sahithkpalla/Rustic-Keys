@@ -5,7 +5,7 @@ Every bundled sample is cut from a recording released under
 isn't required, but we give it anyway. Thank you to the recordists.
 
 Common modifications to every file: taken from the Freesound HQ preview, converted to 48 kHz mono 16-bit WAV,
-cut to a single press or release (1.5 ms pre-roll, at most 180 ms, 20 ms fade-out), peak-normalized
+cut to a single press or release starting at the main hit (1.5 ms pre-roll, at most 180 ms, 20 ms fade-out), peak-normalized
 (press −3 dBFS, release −15 dBFS).
 
 | Files | Original title | Author | Source | License |

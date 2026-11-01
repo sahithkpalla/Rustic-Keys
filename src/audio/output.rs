@@ -2,7 +2,7 @@
 //! audio callback over a lock-free ring buffer; the callback never locks or
 //! allocates.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -26,6 +26,9 @@ pub struct AudioOutput {
     device_id: Option<String>,
     device_name: Option<String>,
     sample_rate: u32,
+    /// (frames in last callback, callback→playback latency in µs)
+    stats: Arc<(AtomicU32, AtomicU32)>,
+    requested: String,
 }
 
 impl AudioOutput {
@@ -45,10 +48,17 @@ impl AudioOutput {
         let errored = Arc::new(AtomicBool::new(false));
         let err_flag = errored.clone();
         let mut mixer = Mixer::new();
+        let stats = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
+        let stats_cb = stats.clone();
+        let requested = format!("{:?}", config.buffer_size);
         let stream = device
             .build_output_stream::<f32, _, _>(
                 config.clone(),
-                move |out, _| {
+                move |out, info: &cpal::OutputCallbackInfo| {
+                    let ts = info.timestamp();
+                    let lat = ts.playback.duration_since(ts.callback);
+                    stats_cb.0.store((out.len() / channels) as u32, Ordering::Relaxed);
+                    stats_cb.1.store(lat.as_micros() as u32, Ordering::Relaxed);
                     while let Ok(p) = consumer.pop() {
                         mixer.trigger(p.sample, p.gain);
                     }
@@ -69,7 +79,14 @@ impl AudioOutput {
             device_id: device.id().ok().map(|id| id.to_string()),
             device_name: Some(device.to_string()),
             sample_rate: config.sample_rate,
+            stats,
+            requested,
         })
+    }
+
+    /// Diagnostics: requested buffer, frames per callback, output latency (µs).
+    pub fn latency_report(&self) -> (String, u32, u32) {
+        (self.requested.clone(), self.stats.0.load(Ordering::Relaxed), self.stats.1.load(Ordering::Relaxed))
     }
 
     pub fn sample_rate(&self) -> u32 {
