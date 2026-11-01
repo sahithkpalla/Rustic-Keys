@@ -4,7 +4,14 @@ use rustic_keys::input::{hid, permission, KeyAction, KeySource};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    use rustic_keys::commands;
     match cli.command {
+        Command::Start { style } => commands::start(style.as_deref()),
+        Command::Stop => commands::stop(),
+        Command::Style { name } => commands::style(&name),
+        Command::Styles => commands::styles(),
+        Command::Volume { level } => commands::volume(level),
+        Command::Status => commands::status(),
         Command::Probe => probe(),
         Command::Demo { style } => demo(&style),
         Command::Daemon => rustic_keys::daemon::run(),

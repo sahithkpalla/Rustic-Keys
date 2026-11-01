@@ -1,8 +1,10 @@
 pub mod audio;
 pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod daemon;
 pub mod filter;
 pub mod input;
 pub mod ipc;
+pub mod launchd;
 pub mod styles;

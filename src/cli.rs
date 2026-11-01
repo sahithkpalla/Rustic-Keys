@@ -11,6 +11,25 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Start clicking now and at every login, until `stop`.
+    Start {
+        /// Switch style to use (see `styles`).
+        #[arg(long)]
+        style: Option<String>,
+    },
+    /// Stop clicking and stop starting at login.
+    Stop,
+    /// Change the switch style.
+    Style { name: String },
+    /// List the available switch styles.
+    Styles,
+    /// Set the volume (0-100).
+    Volume {
+        #[arg(value_parser = clap::value_parser!(u8).range(0..=100))]
+        level: u8,
+    },
+    /// Show whether Rustic Keys is running and how it's set up.
+    Status,
     /// Print every keyboard event with the device it came from (diagnostics).
     #[command(hide = true)]
     Probe,
