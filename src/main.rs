@@ -6,7 +6,30 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Probe => probe(),
+        Command::Demo { style } => demo(&style),
     }
+}
+
+fn demo(name: &str) -> anyhow::Result<()> {
+    use rustic_keys::audio::{output::AudioOutput, sample::load_style};
+    use rustic_keys::filter::Sound;
+    use std::time::Duration;
+    let style = rustic_keys::styles::find(name).ok_or_else(|| anyhow::anyhow!("unknown style '{name}'"))?;
+    let mut out = AudioOutput::start()?;
+    println!("playing {} on {:?} @ {} Hz", style.name, out.device_name(), out.sample_rate());
+    let loaded = load_style(style, out.sample_rate())?;
+    for n in 0..loaded.press.len().max(loaded.release.len()) {
+        out.play(loaded.pick(Sound::Press, n), 0.5);
+        std::thread::sleep(Duration::from_millis(150));
+        out.play(loaded.pick(Sound::Release, n), 0.5);
+        std::thread::sleep(Duration::from_millis(350));
+    }
+    for n in 0..20 {
+        out.play(loaded.pick(Sound::Press, n), 0.5);
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    Ok(())
 }
 
 fn probe() -> anyhow::Result<()> {

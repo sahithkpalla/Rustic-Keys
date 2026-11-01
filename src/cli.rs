@@ -14,4 +14,7 @@ pub enum Command {
     /// Print every keyboard event with the device it came from (diagnostics).
     #[command(hide = true)]
     Probe,
+    /// Play a style's sounds once (diagnostics).
+    #[command(hide = true)]
+    Demo { style: String },
 }
