@@ -62,13 +62,18 @@ pub fn start(style: Option<&str>) -> Result<()> {
         c.style = name.to_string();
         c.save()?;
     }
-    if launchd::is_loaded() {
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .context("finding the rustic-keys executable")?;
+    if launchd::is_loaded() && !launchd::installed_is_stale(&exe) {
         reload_if_running();
         println!("already running");
     } else {
-        let exe = std::env::current_exe()
-            .and_then(|p| p.canonicalize())
-            .context("finding the rustic-keys executable")?;
+        if launchd::is_loaded() {
+            println!("switching the agent to {}", exe.display());
+            launchd::uninstall()?;
+            wait_until_stopped()?;
+        }
         launchd::install(&exe)?;
     }
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -87,6 +92,12 @@ pub fn stop() -> Result<()> {
         println!("not running");
         return Ok(());
     }
+    wait_until_stopped()?;
+    println!("stopped");
+    Ok(())
+}
+
+fn wait_until_stopped() -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while query_status().is_some() {
         if Instant::now() > deadline {
@@ -94,7 +105,6 @@ pub fn stop() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    println!("stopped");
     Ok(())
 }
 

@@ -53,6 +53,30 @@ pub fn plist_xml(exe: &Path, log: &Path, home_override: Option<&Path>) -> String
     )
 }
 
+/// The executable path an installed plist launches (first ProgramArguments entry).
+pub fn installed_program(plist: &str) -> Option<PathBuf> {
+    let after = &plist[plist.find("<key>ProgramArguments</key>")?..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = start + after[start..].find("</string>")?;
+    let raw = after[start..end].replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+    Some(PathBuf::from(raw))
+}
+
+/// Should `start` replace the running agent? Yes if it runs a different
+/// binary, or the same path was rebuilt after the agent was installed.
+pub fn needs_reinstall(installed: Option<&Path>, exe: &Path, exe_rebuilt_since_install: bool) -> bool {
+    installed != Some(exe) || exe_rebuilt_since_install
+}
+
+/// Compare the installed plist with the running binary (see `needs_reinstall`).
+pub fn installed_is_stale(exe: &Path) -> bool {
+    let path = plist_path();
+    let installed = std::fs::read_to_string(&path).ok().and_then(|x| installed_program(&x));
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let rebuilt = matches!((modified(exe), modified(&path)), (Some(e), Some(p)) if e > p);
+    needs_reinstall(installed.as_deref(), exe, rebuilt)
+}
+
 /// `~/Library/LaunchAgents/com.rustickeys.agent.plist`
 pub fn plist_path() -> PathBuf {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
@@ -133,6 +157,24 @@ mod tests {
         assert!(!plist_xml(exe, log, None).contains("RUSTIC_KEYS_HOME"));
         let xml = plist_xml(exe, log, Some(Path::new("/tmp/rkhome")));
         assert!(xml.contains("<key>RUSTIC_KEYS_HOME</key>\n\t\t<string>/tmp/rkhome</string>"));
+    }
+
+    #[test]
+    fn installed_program_roundtrips_plist() {
+        let exe = Path::new("/Users/a&b/.cargo/bin/rustic-keys");
+        let xml = plist_xml(exe, Path::new("/tmp/l"), None);
+        assert_eq!(installed_program(&xml).as_deref(), Some(exe));
+        assert_eq!(installed_program("<plist></plist>"), None);
+    }
+
+    #[test]
+    fn reinstall_when_binary_differs_or_rebuilt() {
+        let installed = Path::new("/proj/target/debug/rustic-keys");
+        let cargo_bin = Path::new("/Users/me/.cargo/bin/rustic-keys");
+        assert!(needs_reinstall(Some(installed), cargo_bin, false));
+        assert!(needs_reinstall(Some(cargo_bin), cargo_bin, true));
+        assert!(needs_reinstall(None, cargo_bin, false), "unreadable plist");
+        assert!(!needs_reinstall(Some(cargo_bin), cargo_bin, false));
     }
 
     #[test]

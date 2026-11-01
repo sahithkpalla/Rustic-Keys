@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct IdleTimer {
     timeout: Duration,
