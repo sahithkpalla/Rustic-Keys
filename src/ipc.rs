@@ -76,7 +76,9 @@ pub fn serve(listener: UnixListener, mut handler: impl FnMut(Request) -> Respons
             }
             let response = match serde_json::from_str::<Request>(line.trim()) {
                 Ok(req) => handler(req),
-                Err(e) => Response::Error { message: format!("bad request: {e}") },
+                Err(e) => Response::Error {
+                    message: format!("bad request: {e}"),
+                },
             };
             let mut stream = stream;
             if let Ok(mut text) = serde_json::to_string(&response) {
@@ -96,7 +98,9 @@ pub fn send(path: &Path, req: &Request, timeout: Duration) -> Result<Response> {
     text.push('\n');
     stream.write_all(text.as_bytes())?;
     let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line).context("reading agent reply")?;
+    BufReader::new(&stream)
+        .read_line(&mut line)
+        .context("reading agent reply")?;
     serde_json::from_str(line.trim()).context("parsing agent reply")
 }
 

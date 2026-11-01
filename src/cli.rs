@@ -3,7 +3,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "rustic-keys", version, about = "Mechanical keyboard sounds for your MacBook's built-in keyboard")]
+#[command(
+    name = "rustic-keys",
+    version,
+    about = "Mechanical keyboard sounds for your MacBook's built-in keyboard"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -41,5 +45,9 @@ pub enum Command {
     CheckAccess,
     /// Run the background agent (launched by launchd).
     #[command(hide = true)]
-    Daemon,
+    Daemon {
+        /// Consecutive self-restarts so far (set by the agent itself).
+        #[arg(long, default_value_t = 0, hide = true)]
+        reexecs: u32,
+    },
 }

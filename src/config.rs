@@ -5,14 +5,16 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::filter::{Mode, DEFAULT_MODE};
+use crate::filter::{DEFAULT_MODE, Mode};
 
 /// `$RUSTIC_KEYS_HOME`, else `~/Library/Application Support/rustic-keys`.
 pub fn home_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("RUSTIC_KEYS_HOME").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
     home.join("Library/Application Support/rustic-keys")
 }
 
@@ -38,7 +40,11 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { style: "clicky".into(), volume: 70, mode: DEFAULT_MODE }
+        Config {
+            style: "clicky".into(),
+            volume: 70,
+            mode: DEFAULT_MODE,
+        }
     }
 }
 
@@ -89,7 +95,11 @@ mod tests {
     #[test]
     fn save_then_load_roundtrips() {
         with_home(|_| {
-            let c = Config { style: "thocky".into(), volume: 40, mode: Mode::Presence };
+            let c = Config {
+                style: "thocky".into(),
+                volume: 40,
+                mode: Mode::Presence,
+            };
             c.save().unwrap();
             assert_eq!(Config::load().unwrap(), c);
         });

@@ -14,7 +14,11 @@ pub struct IdleTimer {
 
 impl IdleTimer {
     pub fn new(timeout: Duration, now: Instant) -> Self {
-        IdleTimer { timeout, last_activity: now, paused: false }
+        IdleTimer {
+            timeout,
+            last_activity: now,
+            paused: false,
+        }
     }
 
     /// A sound is about to play. Returns `true` if the stream must be resumed first.

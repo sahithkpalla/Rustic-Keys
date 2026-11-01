@@ -16,7 +16,10 @@ pub fn decode_wav(bytes: &[u8], target_rate: u32) -> Result<Arc<[f32]>> {
         hound::SampleFormat::Float => reader.into_samples::<f32>().collect::<Result<_, _>>()?,
         hound::SampleFormat::Int => {
             let scale = 1.0 / (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader.into_samples::<i32>().map(|s| s.map(|v| v as f32 * scale)).collect::<Result<_, _>>()?
+            reader
+                .into_samples::<i32>()
+                .map(|s| s.map(|v| v as f32 * scale))
+                .collect::<Result<_, _>>()?
         }
     };
     let mono: Vec<f32> = interleaved
@@ -52,8 +55,15 @@ pub struct LoadedStyle {
 
 pub fn load_style(s: &Style, rate: u32) -> Result<LoadedStyle> {
     let decode = |set: &[&[u8]]| -> Result<Vec<Arc<[f32]>>> { set.iter().map(|b| decode_wav(b, rate)).collect() };
-    let loaded = LoadedStyle { press: decode(s.press)?, release: decode(s.release)? };
-    anyhow::ensure!(!loaded.press.is_empty() && !loaded.release.is_empty(), "style {} has no samples", s.name);
+    let loaded = LoadedStyle {
+        press: decode(s.press)?,
+        release: decode(s.release)?,
+    };
+    anyhow::ensure!(
+        !loaded.press.is_empty() && !loaded.release.is_empty(),
+        "style {} has no samples",
+        s.name
+    );
     Ok(loaded)
 }
 
@@ -70,7 +80,12 @@ impl LoadedStyle {
 
 #[cfg(test)]
 pub(crate) fn wav_bytes(rate: u32, channels: u16, frames: &[i16]) -> Vec<u8> {
-    let spec = hound::WavSpec { channels, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate: rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
     let mut cur = std::io::Cursor::new(Vec::new());
     let mut w = hound::WavWriter::new(&mut cur, spec).unwrap();
     for s in frames {

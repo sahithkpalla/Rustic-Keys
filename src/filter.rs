@@ -33,7 +33,11 @@ pub struct Filter {
 
 impl Filter {
     pub fn new(mode: Mode) -> Self {
-        Filter { mode, external_connected: false, held: HashSet::new() }
+        Filter {
+            mode,
+            external_connected: false,
+            held: HashSet::new(),
+        }
     }
 
     pub fn set_mode(&mut self, mode: Mode) {

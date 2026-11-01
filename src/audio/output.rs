@@ -2,15 +2,15 @@
 //! audio callback over a lock-free ring buffer; the callback never locks or
 //! allocates.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, StreamConfig, SupportedBufferSize};
 
-use super::idle::{IdleTimer, IDLE_TIMEOUT};
+use super::idle::{IDLE_TIMEOUT, IdleTimer};
 use super::mixer::Mixer;
 
 const RING_CAPACITY: usize = 256;
@@ -40,13 +40,19 @@ impl AudioOutput {
     /// Open the current default output device.
     pub fn start() -> Result<AudioOutput> {
         let host = cpal::default_host();
-        let device = host.default_output_device().ok_or_else(|| anyhow!("no audio output device"))?;
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no audio output device"))?;
         let supported = device.default_output_config().context("querying output config")?;
         let buffer_size = match supported.buffer_size() {
             SupportedBufferSize::Range { min, max } => BufferSize::Fixed(TARGET_BUFFER_FRAMES.clamp(*min, *max)),
             SupportedBufferSize::Unknown => BufferSize::Default,
         };
-        let config = StreamConfig { channels: supported.channels(), sample_rate: supported.sample_rate(), buffer_size };
+        let config = StreamConfig {
+            channels: supported.channels(),
+            sample_rate: supported.sample_rate(),
+            buffer_size,
+        };
         let channels = config.channels as usize;
 
         let (producer, mut consumer) = rtrb::RingBuffer::<Play>::new(RING_CAPACITY);
@@ -59,7 +65,7 @@ impl AudioOutput {
         let requested = format!("{:?}", config.buffer_size);
         let stream = device
             .build_output_stream::<f32, _, _>(
-                config.clone(),
+                config,
                 move |out, info: &cpal::OutputCallbackInfo| {
                     let ts = info.timestamp();
                     let lat = ts.playback.duration_since(ts.callback);
@@ -94,7 +100,11 @@ impl AudioOutput {
 
     /// Diagnostics: requested buffer, frames per callback, output latency (µs).
     pub fn latency_report(&self) -> (String, u32, u32) {
-        (self.requested.clone(), self.stats.0.load(Ordering::Relaxed), self.stats.1.load(Ordering::Relaxed))
+        (
+            self.requested.clone(),
+            self.stats.0.load(Ordering::Relaxed),
+            self.stats.1.load(Ordering::Relaxed),
+        )
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -109,11 +119,11 @@ impl AudioOutput {
     /// Never blocks except for that resume; drops the sound if the ring is full.
     pub fn play(&mut self, sample: Arc<[f32]>, gain: f32) {
         self.free_retired();
-        if self.idle.on_activity(Instant::now()) {
-            if let Err(e) = self._stream.play() {
-                eprintln!("audio resume failed: {e}");
-                self.errored.store(true, Ordering::Relaxed);
-            }
+        if self.idle.on_activity(Instant::now())
+            && let Err(e) = self._stream.play()
+        {
+            eprintln!("audio resume failed: {e}");
+            self.errored.store(true, Ordering::Relaxed);
         }
         let _ = self.producer.push(Play { sample, gain });
     }
@@ -121,10 +131,10 @@ impl AudioOutput {
     /// Pause the stream after `IDLE_TIMEOUT` without sounds, so macOS can sleep.
     pub fn pause_if_idle(&mut self) {
         self.free_retired();
-        if self.idle.on_tick(Instant::now()) {
-            if let Err(e) = self._stream.pause() {
-                eprintln!("audio pause failed: {e}");
-            }
+        if self.idle.on_tick(Instant::now())
+            && let Err(e) = self._stream.pause()
+        {
+            eprintln!("audio pause failed: {e}");
         }
     }
 

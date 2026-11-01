@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config};
 use crate::input::permission::Access;
@@ -44,12 +44,22 @@ fn print_status(s: &StatusReport) {
     println!("style: {}", s.style);
     println!("volume: {}", s.volume);
     println!("mode: {mode}");
-    println!("permission: {}", match s.permission {
-        Access::Granted => "granted",
-        Access::Denied => "denied",
-        Access::Unknown => "not yet granted",
-    });
-    println!("external keyboard: {}", if s.external_keyboard_connected { "connected" } else { "not connected" });
+    println!(
+        "permission: {}",
+        match s.permission {
+            Access::Granted => "granted",
+            Access::Denied => "denied",
+            Access::Unknown => "not yet granted",
+        }
+    );
+    println!(
+        "external keyboard: {}",
+        if s.external_keyboard_connected {
+            "connected"
+        } else {
+            "not connected"
+        }
+    );
     println!("audio device: {}", s.audio_device.as_deref().unwrap_or("none"));
     if s.permission != Access::Granted {
         println!();
@@ -103,7 +113,10 @@ fn wait_until_stopped() -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while query_status().is_some() {
         if Instant::now() > deadline {
-            bail!("the agent is still answering after stop; see {}", config::log_path().display());
+            bail!(
+                "the agent is still answering after stop; see {}",
+                config::log_path().display()
+            );
         }
         std::thread::sleep(Duration::from_millis(100));
     }

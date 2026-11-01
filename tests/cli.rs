@@ -29,7 +29,9 @@ fn style_unknown_fails_with_list() {
         .args(["style", "banana"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("unknown style 'banana'; available: clicky, tactile, thocky"));
+        .stderr(predicate::str::contains(
+            "unknown style 'banana'; available: clicky, tactile, thocky",
+        ));
 }
 
 #[test]
@@ -38,7 +40,10 @@ fn style_known_persists() {
     rk(&home).args(["style", "thocky"]).assert().success();
     let text = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
     assert!(text.contains("style = \"thocky\""), "{text}");
-    rk(&home).arg("styles").assert().stdout(predicate::str::contains("* thocky"));
+    rk(&home)
+        .arg("styles")
+        .assert()
+        .stdout(predicate::str::contains("* thocky"));
 }
 
 #[test]
@@ -58,7 +63,11 @@ fn volume_persists() {
 #[test]
 fn status_when_not_running() {
     let home = tempfile::tempdir().unwrap();
-    rk(&home).arg("status").assert().success().stdout(predicate::str::contains("not running"));
+    rk(&home)
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not running"));
 }
 
 #[test]

@@ -22,13 +22,20 @@ pub struct Mixer {
 
 impl Mixer {
     pub fn new() -> Self {
-        Mixer { voices: std::array::from_fn(|_| None), next_seq: 0, retire: None }
+        Mixer {
+            voices: std::array::from_fn(|_| None),
+            next_seq: 0,
+            retire: None,
+        }
     }
 
     /// A mixer that hands samples it no longer needs to `retire` (drained and
     /// dropped by the owner off the audio thread).
     pub fn with_retire(retire: rtrb::Producer<Arc<[f32]>>) -> Self {
-        Mixer { retire: Some(retire), ..Mixer::new() }
+        Mixer {
+            retire: Some(retire),
+            ..Mixer::new()
+        }
     }
 
     fn release(&mut self, sample: Arc<[f32]>) {
@@ -50,7 +57,12 @@ impl Mixer {
                 .min_by_key(|&i| self.voices[i].as_ref().map_or(0, |v| v.seq))
                 .unwrap_or(0),
         };
-        if let Some(old) = self.voices[slot].replace(Voice { sample, pos: 0, gain, seq: self.next_seq }) {
+        if let Some(old) = self.voices[slot].replace(Voice {
+            sample,
+            pos: 0,
+            gain,
+            seq: self.next_seq,
+        }) {
             self.release(old.sample);
         }
         self.next_seq += 1;
@@ -65,10 +77,10 @@ impl Mixer {
                 let Some(v) = self.voices[i].as_mut() else { continue };
                 acc += v.sample[v.pos] * v.gain;
                 v.pos += 1;
-                if v.pos >= v.sample.len() {
-                    if let Some(done) = self.voices[i].take() {
-                        self.release(done.sample);
-                    }
+                if v.pos >= v.sample.len()
+                    && let Some(done) = self.voices[i].take()
+                {
+                    self.release(done.sample);
                 }
             }
             frame.fill(acc.clamp(-1.0, 1.0));

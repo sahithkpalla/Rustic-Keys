@@ -7,12 +7,12 @@ use std::ffi::c_void;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
-use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoop};
+use core_foundation::runloop::{CFRunLoop, kCFRunLoopDefaultMode};
 use core_foundation::string::CFString;
 use io_kit_sys::hid::base::{IOHIDDeviceRef, IOHIDValueRef};
 use io_kit_sys::hid::device::IOHIDDeviceGetProperty;
@@ -22,14 +22,20 @@ use io_kit_sys::hid::manager::*;
 use io_kit_sys::hid::value::{IOHIDValueGetElement, IOHIDValueGetIntegerValue, IOHIDValueGetTimeStamp};
 use io_kit_sys::ret::IOReturn;
 
-use super::{classify, is_key_usage, DeviceInfo, KeyAction, KeyEvent, KeySource};
+use super::{DeviceInfo, KeyAction, KeyEvent, KeySource, classify, is_key_usage};
 
 #[derive(Debug, Clone)]
 pub enum InputMsg {
     Key(KeyEvent),
-    Devices { builtin: usize, external: usize },
+    Devices {
+        builtin: usize,
+        external: usize,
+    },
     /// A keyboard was connected (diagnostics for `probe` and logs).
-    DeviceSeen { info: DeviceInfo, source: KeySource },
+    DeviceSeen {
+        info: DeviceInfo,
+        source: KeySource,
+    },
 }
 
 /// Connected keyboards, keyed by IOHIDDevice pointer. Only the matching and
@@ -95,7 +101,11 @@ impl Ctx {
 fn prop(device: IOHIDDeviceRef, key: &'static str) -> Option<CFType> {
     let k = CFString::from_static_string(key);
     let r = unsafe { IOHIDDeviceGetProperty(device, k.as_concrete_TypeRef()) };
-    if r.is_null() { None } else { Some(unsafe { CFType::wrap_under_get_rule(r) }) }
+    if r.is_null() {
+        None
+    } else {
+        Some(unsafe { CFType::wrap_under_get_rule(r) })
+    }
 }
 
 fn device_info(device: IOHIDDeviceRef) -> DeviceInfo {
@@ -106,8 +116,16 @@ fn device_info(device: IOHIDDeviceRef) -> DeviceInfo {
             v.downcast::<CFNumber>().and_then(|n| n.to_i64()).map(|n| n != 0)
         }
     });
-    let string = |key| prop(device, key).and_then(|v| v.downcast::<CFString>()).map(|s| s.to_string());
-    DeviceInfo { built_in, transport: string("Transport"), product: string("Product") }
+    let string = |key| {
+        prop(device, key)
+            .and_then(|v| v.downcast::<CFString>())
+            .map(|s| s.to_string())
+    };
+    DeviceInfo {
+        built_in,
+        transport: string("Transport"),
+        product: string("Product"),
+    }
 }
 
 unsafe fn ctx<'a>(context: *mut c_void) -> &'a RefCell<Ctx> {
@@ -140,8 +158,15 @@ unsafe extern "C" fn on_value(context: *mut c_void, _r: IOReturn, _s: *mut c_voi
     }
     let device = unsafe { IOHIDElementGetDevice(element) };
     let c = ctx.borrow();
-    let source = c.devices.source_of(device as usize).unwrap_or_else(|| classify(&device_info(device)));
-    let action = if unsafe { IOHIDValueGetIntegerValue(value) } != 0 { KeyAction::Down } else { KeyAction::Up };
+    let source = c
+        .devices
+        .source_of(device as usize)
+        .unwrap_or_else(|| classify(&device_info(device)));
+    let action = if unsafe { IOHIDValueGetIntegerValue(value) } != 0 {
+        KeyAction::Down
+    } else {
+        KeyAction::Up
+    };
     if std::env::var_os("RUSTIC_KEYS_TRACE").is_some() {
         trace_delivery(unsafe { IOHIDValueGetTimeStamp(value) });
     }
@@ -169,7 +194,10 @@ pub fn spawn_listener(tx: Sender<InputMsg>) -> Result<JoinHandle<()>> {
         .spawn(move || {
             // Owned by the run loop for the life of the process; freed only if
             // opening fails below.
-            let ctx_ptr = Box::into_raw(Box::new(RefCell::new(Ctx { tx, devices: DeviceRegistry::default() })));
+            let ctx_ptr = Box::into_raw(Box::new(RefCell::new(Ctx {
+                tx,
+                devices: DeviceRegistry::default(),
+            })));
             let context = ctx_ptr as *mut c_void;
             unsafe {
                 let manager = IOHIDManagerCreate(std::ptr::null(), kIOHIDManagerOptionNone);
@@ -195,7 +223,9 @@ pub fn spawn_listener(tx: Sender<InputMsg>) -> Result<JoinHandle<()>> {
                 match open_outcome(ret) {
                     OpenOutcome::Opened => {}
                     OpenOutcome::Partial => {
-                        eprintln!("[rustic-keys] some keyboards couldn't be opened (0x{ret:08x}); listening to the rest");
+                        eprintln!(
+                            "[rustic-keys] some keyboards couldn't be opened (0x{ret:08x}); listening to the rest"
+                        );
                     }
                     OpenOutcome::NotPermitted => {
                         // Tear everything down so retries don't leak.

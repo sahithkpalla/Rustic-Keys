@@ -3,12 +3,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 pub const LABEL: &str = "com.rustickeys.agent";
 
 fn escape(p: &Path) -> String {
-    p.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    p.to_string_lossy()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 pub fn plist_xml(exe: &Path, log: &Path, home_override: Option<&Path>) -> String {
@@ -58,7 +61,10 @@ pub fn installed_program(plist: &str) -> Option<PathBuf> {
     let after = &plist[plist.find("<key>ProgramArguments</key>")?..];
     let start = after.find("<string>")? + "<string>".len();
     let end = start + after[start..].find("</string>")?;
-    let raw = after[start..end].replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+    let raw = after[start..end]
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
     Some(PathBuf::from(raw))
 }
 
@@ -79,7 +85,9 @@ pub fn installed_is_stale(exe: &Path) -> bool {
 
 /// `~/Library/LaunchAgents/com.rustickeys.agent.plist`
 pub fn plist_path() -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
     home.join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
 }
 
@@ -88,7 +96,10 @@ fn domain() -> String {
 }
 
 fn launchctl(args: &[&str]) -> Result<std::process::Output> {
-    Command::new("launchctl").args(args).output().context("running launchctl")
+    Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("running launchctl")
 }
 
 /// Is the agent loaded in this login session?
@@ -108,7 +119,10 @@ pub fn install(exe: &Path) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))?;
     let out = launchctl(&["bootstrap", &domain(), &path.to_string_lossy()])?;
     if !out.status.success() {
-        bail!("launchctl bootstrap failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(
+            "launchctl bootstrap failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -123,7 +137,10 @@ pub fn uninstall() -> Result<bool> {
     if loaded {
         let out = launchctl(&["bootout", &format!("{}/{LABEL}", domain())])?;
         if !out.status.success() && is_loaded() {
-            bail!("launchctl bootout failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            bail!(
+                "launchctl bootout failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
     }
     if path.exists() {
@@ -138,7 +155,11 @@ mod tests {
 
     #[test]
     fn plist_contains_program_and_keepalive() {
-        let xml = plist_xml(Path::new("/Users/me/.cargo/bin/rustic-keys"), Path::new("/tmp/agent.log"), None);
+        let xml = plist_xml(
+            Path::new("/Users/me/.cargo/bin/rustic-keys"),
+            Path::new("/tmp/agent.log"),
+            None,
+        );
         assert!(xml.contains("<string>com.rustickeys.agent</string>"));
         assert!(xml.contains("<string>/Users/me/.cargo/bin/rustic-keys</string>"));
         assert!(xml.contains("<string>daemon</string>"));

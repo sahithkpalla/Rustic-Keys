@@ -62,7 +62,11 @@ mod tests {
     #[test]
     fn builtin_flag_wins() {
         assert_eq!(
-            classify(&DeviceInfo { built_in: Some(true), transport: Some("USB".into()), product: None }),
+            classify(&DeviceInfo {
+                built_in: Some(true),
+                transport: Some("USB".into()),
+                product: None
+            }),
             KeySource::BuiltIn
         );
     }

@@ -78,7 +78,13 @@ mod tests {
                 let pcm = decode_wav(bytes, 48000).unwrap();
                 let peak = pcm.iter().fold(0.0f32, |m, x| m.max(x.abs()));
                 let first = pcm.iter().position(|x| x.abs() >= peak * 0.5).unwrap();
-                assert!(first <= 240, "{} press-{}: hit at {:.1} ms", s.name, i + 1, first as f32 / 48.0);
+                assert!(
+                    first <= 240,
+                    "{} press-{}: hit at {:.1} ms",
+                    s.name,
+                    i + 1,
+                    first as f32 / 48.0
+                );
             }
         }
     }
