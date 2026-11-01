@@ -26,7 +26,7 @@ fn demo(name: &str) -> anyhow::Result<()> {
     }
     for n in 0..20 {
         out.play(loaded.pick(Sound::Press, n), 0.5);
-        std::thread::sleep(Duration::from_millis(15));
+        std::thread::sleep(Duration::from_millis(60));
     }
     std::thread::sleep(Duration::from_millis(400));
     Ok(())
