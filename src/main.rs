@@ -7,6 +7,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Probe => probe(),
         Command::Demo { style } => demo(&style),
+        Command::Daemon => rustic_keys::daemon::run(),
     }
 }
 

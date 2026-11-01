@@ -17,4 +17,7 @@ pub enum Command {
     /// Play a style's sounds once (diagnostics).
     #[command(hide = true)]
     Demo { style: String },
+    /// Run the background agent (launched by launchd).
+    #[command(hide = true)]
+    Daemon,
 }
