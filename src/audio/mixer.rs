@@ -1,13 +1,13 @@
 //! Real-time voice mixer. `render` runs on the audio thread: it never
-//! allocates or locks.
+//! allocates, locks, or frees. Samples it is done with (finished or stolen
+//! voices) are handed back over a ring so their memory is released on the
+//! agent thread instead.
 
 use std::sync::Arc;
 
 pub const MAX_VOICES: usize = 32;
 
 struct Voice {
-    // The same Arc is also held by `LoadedStyle`, so dropping a finished
-    // voice here is only a refcount decrement, never a deallocation.
     sample: Arc<[f32]>,
     pos: usize,
     gain: f32,
@@ -17,16 +17,31 @@ struct Voice {
 pub struct Mixer {
     voices: [Option<Voice>; MAX_VOICES],
     next_seq: u64,
+    retire: Option<rtrb::Producer<Arc<[f32]>>>,
 }
 
 impl Mixer {
     pub fn new() -> Self {
-        Mixer { voices: std::array::from_fn(|_| None), next_seq: 0 }
+        Mixer { voices: std::array::from_fn(|_| None), next_seq: 0, retire: None }
+    }
+
+    /// A mixer that hands samples it no longer needs to `retire` (drained and
+    /// dropped by the owner off the audio thread).
+    pub fn with_retire(retire: rtrb::Producer<Arc<[f32]>>) -> Self {
+        Mixer { retire: Some(retire), ..Mixer::new() }
+    }
+
+    fn release(&mut self, sample: Arc<[f32]>) {
+        if let Some(r) = self.retire.as_mut() {
+            // If the ring is full the Arc drops here: a rare fallback.
+            let _ = r.push(sample);
+        }
     }
 
     /// Start a voice; when all slots are busy the oldest voice is replaced.
     pub fn trigger(&mut self, sample: Arc<[f32]>, gain: f32) {
         if sample.is_empty() {
+            self.release(sample);
             return;
         }
         let slot = match self.voices.iter().position(Option::is_none) {
@@ -35,7 +50,9 @@ impl Mixer {
                 .min_by_key(|&i| self.voices[i].as_ref().map_or(0, |v| v.seq))
                 .unwrap_or(0),
         };
-        self.voices[slot] = Some(Voice { sample, pos: 0, gain, seq: self.next_seq });
+        if let Some(old) = self.voices[slot].replace(Voice { sample, pos: 0, gain, seq: self.next_seq }) {
+            self.release(old.sample);
+        }
         self.next_seq += 1;
     }
 
@@ -44,12 +61,13 @@ impl Mixer {
         let channels = channels.max(1);
         for frame in out.chunks_mut(channels) {
             let mut acc = 0.0f32;
-            for slot in self.voices.iter_mut() {
-                if let Some(v) = slot {
-                    acc += v.sample[v.pos] * v.gain;
-                    v.pos += 1;
-                    if v.pos >= v.sample.len() {
-                        *slot = None;
+            for i in 0..MAX_VOICES {
+                let Some(v) = self.voices[i].as_mut() else { continue };
+                acc += v.sample[v.pos] * v.gain;
+                v.pos += 1;
+                if v.pos >= v.sample.len() {
+                    if let Some(done) = self.voices[i].take() {
+                        self.release(done.sample);
                     }
                 }
             }
@@ -67,6 +85,29 @@ impl Default for Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_samples_are_handed_back_for_freeing() {
+        let (tx, mut rx) = rtrb::RingBuffer::new(64);
+        let mut m = Mixer::with_retire(tx);
+        m.trigger(Arc::from(vec![0.1f32; 2]), 1.0);
+        let mut out = [0.0f32; 4];
+        m.render(&mut out, 1);
+        assert_eq!(rx.slots(), 1, "one finished sample handed back");
+        assert_eq!(rx.pop().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stolen_samples_are_handed_back_for_freeing() {
+        let (tx, mut rx) = rtrb::RingBuffer::new(64);
+        let mut m = Mixer::with_retire(tx);
+        for _ in 0..MAX_VOICES {
+            m.trigger(Arc::from(vec![0.01f32; 1000]), 1.0);
+        }
+        m.trigger(Arc::from(vec![0.5f32; 7]), 1.0);
+        assert_eq!(rx.pop().unwrap().len(), 1000, "oldest voice handed back when stolen");
+        assert!(rx.pop().is_err());
+    }
 
     #[test]
     fn renders_then_silence() {

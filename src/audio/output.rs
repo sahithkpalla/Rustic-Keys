@@ -32,6 +32,8 @@ pub struct AudioOutput {
     stats: Arc<(AtomicU32, AtomicU32)>,
     requested: String,
     idle: IdleTimer,
+    /// Samples the audio thread is done with; dropped here, off that thread.
+    retired: rtrb::Consumer<Arc<[f32]>>,
 }
 
 impl AudioOutput {
@@ -50,7 +52,8 @@ impl AudioOutput {
         let (producer, mut consumer) = rtrb::RingBuffer::<Play>::new(RING_CAPACITY);
         let errored = Arc::new(AtomicBool::new(false));
         let err_flag = errored.clone();
-        let mut mixer = Mixer::new();
+        let (retire_tx, retired) = rtrb::RingBuffer::<Arc<[f32]>>::new(RING_CAPACITY);
+        let mut mixer = Mixer::with_retire(retire_tx);
         let stats = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
         let stats_cb = stats.clone();
         let requested = format!("{:?}", config.buffer_size);
@@ -85,6 +88,7 @@ impl AudioOutput {
             stats,
             requested,
             idle: IdleTimer::new(IDLE_TIMEOUT, Instant::now()),
+            retired,
         })
     }
 
@@ -104,6 +108,7 @@ impl AudioOutput {
     /// Queue a sound, resuming the stream first if it was idle-paused.
     /// Never blocks except for that resume; drops the sound if the ring is full.
     pub fn play(&mut self, sample: Arc<[f32]>, gain: f32) {
+        self.free_retired();
         if self.idle.on_activity(Instant::now()) {
             if let Err(e) = self._stream.play() {
                 eprintln!("audio resume failed: {e}");
@@ -115,11 +120,16 @@ impl AudioOutput {
 
     /// Pause the stream after `IDLE_TIMEOUT` without sounds, so macOS can sleep.
     pub fn pause_if_idle(&mut self) {
+        self.free_retired();
         if self.idle.on_tick(Instant::now()) {
             if let Err(e) = self._stream.pause() {
                 eprintln!("audio pause failed: {e}");
             }
         }
+    }
+
+    fn free_retired(&mut self) {
+        while self.retired.pop().is_ok() {}
     }
 
     pub fn is_paused(&self) -> bool {
