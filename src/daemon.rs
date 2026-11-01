@@ -76,6 +76,43 @@ impl AgentState {
     }
 }
 
+/// What to do about keyboard access on a tick, before listening has started.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PermissionStep {
+    /// Access is usable in this process: start the HID listener.
+    Listen,
+    /// Granted, but only a fresh process can use it (macOS caches the
+    /// decision per process): re-exec the agent.
+    Restart,
+    Wait,
+}
+
+pub fn permission_step(in_process: Access, fresh_process_granted: impl FnOnce() -> bool) -> PermissionStep {
+    if in_process == Access::Granted {
+        PermissionStep::Listen
+    } else if fresh_process_granted() {
+        PermissionStep::Restart
+    } else {
+        PermissionStep::Wait
+    }
+}
+
+/// Ask a brand-new process (same binary, so same permission identity).
+fn fresh_process_granted() -> bool {
+    std::env::current_exe()
+        .and_then(|exe| std::process::Command::new(exe).arg("check-access").status())
+        .is_ok_and(|s| s.success())
+}
+
+/// Replace this process with a fresh agent so a new grant takes effect.
+fn reexec() -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    match std::env::current_exe() {
+        Ok(exe) => std::process::Command::new(exe).arg("daemon").exec(),
+        Err(e) => e,
+    }
+}
+
 enum AgentMsg {
     Input(InputMsg),
     Ipc(Request, mpsc::Sender<Response>),
@@ -178,7 +215,12 @@ pub fn run() -> Result<()> {
                 if !listening {
                     let access = permission::check();
                     state.set_permission(access);
-                    if access == Access::Granted {
+                    let step = permission_step(access, fresh_process_granted);
+                    if step == PermissionStep::Restart {
+                        log("Input Monitoring permission granted; restarting to apply it");
+                        log(format!("restart failed: {}", reexec()));
+                    }
+                    if step == PermissionStep::Listen {
                         let (in_tx, in_rx) = mpsc::channel();
                         match hid::spawn_listener(in_tx) {
                             Ok(_) => {
@@ -251,6 +293,22 @@ mod tests {
         assert_eq!(s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)), Some(Sound::Press));
         s.set_permission(Access::Granted);
         assert_eq!(s.status().permission, Access::Granted);
+    }
+
+    #[test]
+    fn permission_step_listens_when_granted_in_process() {
+        assert_eq!(permission_step(Access::Granted, || panic!("no need to ask")), PermissionStep::Listen);
+    }
+
+    #[test]
+    fn permission_step_restarts_when_granted_only_in_fresh_process() {
+        assert_eq!(permission_step(Access::Denied, || true), PermissionStep::Restart);
+        assert_eq!(permission_step(Access::Unknown, || true), PermissionStep::Restart);
+    }
+
+    #[test]
+    fn permission_step_waits_when_still_denied() {
+        assert_eq!(permission_step(Access::Denied, || false), PermissionStep::Wait);
     }
 
     #[test]

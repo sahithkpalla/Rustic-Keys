@@ -15,6 +15,7 @@ fn main() -> anyhow::Result<()> {
         Command::Probe => probe(),
         Command::Demo { style } => demo(&style),
         Command::Daemon => rustic_keys::daemon::run(),
+        Command::CheckAccess => std::process::exit(if permission::check() == permission::Access::Granted { 0 } else { 1 }),
     }
 }
 

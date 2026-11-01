@@ -36,6 +36,9 @@ pub enum Command {
     /// Play a style's sounds once (diagnostics).
     #[command(hide = true)]
     Demo { style: String },
+    /// Exit 0 if this binary has Input Monitoring permission (used by the agent).
+    #[command(hide = true)]
+    CheckAccess,
     /// Run the background agent (launched by launchd).
     #[command(hide = true)]
     Daemon,
