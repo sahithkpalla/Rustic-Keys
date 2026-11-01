@@ -113,6 +113,26 @@ fn reexec() -> std::io::Error {
     }
 }
 
+/// While listening: what a fresh-process access check means. A revocation
+/// stops input silently, and a later re-grant only works in a new process.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recheck {
+    Fine,
+    MarkDenied,
+    Restart,
+}
+
+pub fn recheck_while_listening(fresh_granted: bool, marked_denied: bool) -> Recheck {
+    match (fresh_granted, marked_denied) {
+        (false, _) => Recheck::MarkDenied,
+        (true, true) => Recheck::Restart,
+        (true, false) => Recheck::Fine,
+    }
+}
+
+/// Re-verify access every this many ticks while listening (~30 s).
+const RECHECK_EVERY_TICKS: u32 = 15;
+
 enum AgentMsg {
     Input(InputMsg),
     Ipc(Request, mpsc::Sender<Response>),
@@ -171,6 +191,23 @@ pub fn run() -> Result<()> {
     let mut output: Option<AudioOutput> = None;
     let mut loaded: Option<LoadedStyle> = None;
     let mut listening = false;
+    let mut ticks: u32 = 0;
+    let recheck = |state: &mut AgentState| match recheck_while_listening(
+        fresh_process_granted(),
+        state.status().permission == Access::Denied,
+    ) {
+        Recheck::Fine => {}
+        Recheck::MarkDenied => {
+            if state.status().permission != Access::Denied {
+                log("Input Monitoring permission was revoked; waiting for it to be granted again");
+            }
+            state.set_permission(Access::Denied);
+        }
+        Recheck::Restart => {
+            log("Input Monitoring permission granted again; restarting to apply it");
+            log(format!("restart failed: {}", reexec()));
+        }
+    };
     let mut variant = 0usize;
 
     let access = permission::check();
@@ -210,6 +247,10 @@ pub fn run() -> Result<()> {
                 }
                 if let Some(o) = output.as_mut() {
                     o.pause_if_idle();
+                }
+                ticks = ticks.wrapping_add(1);
+                if listening && ticks % RECHECK_EVERY_TICKS == 0 {
+                    recheck(&mut state);
                 }
                 // Input: start listening once permission is granted.
                 if !listening {
@@ -253,7 +294,12 @@ pub fn run() -> Result<()> {
             }
             AgentMsg::Ipc(req, reply) => {
                 let response = match req {
-                    Request::Status => Response::Status(state.status()),
+                    Request::Status => {
+                        if listening {
+                            recheck(&mut state);
+                        }
+                        Response::Status(state.status())
+                    }
                     Request::Reload => match Config::load() {
                         Ok(c) => {
                             let style_changed = c.style != state.config().style;
@@ -309,6 +355,22 @@ mod tests {
     #[test]
     fn permission_step_waits_when_still_denied() {
         assert_eq!(permission_step(Access::Denied, || false), PermissionStep::Wait);
+    }
+
+    #[test]
+    fn recheck_marks_revoked_permission_denied() {
+        assert_eq!(recheck_while_listening(false, false), Recheck::MarkDenied);
+        assert_eq!(recheck_while_listening(false, true), Recheck::MarkDenied);
+    }
+
+    #[test]
+    fn recheck_restarts_when_regranted_after_revoke() {
+        assert_eq!(recheck_while_listening(true, true), Recheck::Restart);
+    }
+
+    #[test]
+    fn recheck_fine_while_still_granted() {
+        assert_eq!(recheck_while_listening(true, false), Recheck::Fine);
     }
 
     #[test]
