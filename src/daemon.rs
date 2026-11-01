@@ -244,6 +244,7 @@ struct Agent {
     reexecs: u32,
     audio_log: Dedup,
     input_log: Dedup,
+    probe_log: Dedup,
 }
 
 impl Agent {
@@ -327,6 +328,11 @@ impl Agent {
 
     fn tick_input(&mut self) {
         if self.listening {
+            // Diagnostic: does the cheap in-process check notice a revoke?
+            let in_process = format!("in-process permission check while listening: {:?}", permission::check());
+            if self.probe_log.changed(&in_process) {
+                log(in_process);
+            }
             if self.state.take_recheck_due() {
                 self.recheck_permission();
             }
@@ -459,6 +465,7 @@ pub fn run(reexecs: u32) -> Result<()> {
         reexecs,
         audio_log: Dedup::default(),
         input_log: Dedup::default(),
+        probe_log: Dedup::default(),
     };
 
     if permission::check() != Access::Granted && !permission::request() {
