@@ -21,6 +21,7 @@ pub struct AgentState {
     external_connected: bool,
     permission: Access,
     audio_device: Option<String>,
+    typed_since_check: bool,
 }
 
 impl AgentState {
@@ -32,12 +33,20 @@ impl AgentState {
             external_connected: false,
             permission: Access::Unknown,
             audio_device: None,
+            typed_since_check: false,
         }
     }
 
     pub fn handle_input(&mut self, msg: InputMsg) -> Option<Sound> {
         match msg {
-            InputMsg::Key(ev) => self.filter.decide(&ev),
+            InputMsg::Key(ev) => {
+                self.typed_since_check = true;
+                // Only sound while we're allowed to see keys at all.
+                if self.permission != Access::Granted {
+                    return None;
+                }
+                self.filter.decide(&ev)
+            }
             InputMsg::Devices { external, .. } => {
                 self.external_connected = external > 0;
                 self.filter.set_external_connected(self.external_connected);
@@ -58,6 +67,12 @@ impl AgentState {
 
     pub fn set_audio_device(&mut self, name: Option<String>) {
         self.audio_device = name;
+    }
+
+    /// Has a key arrived since the last call? Permission is re-verified only
+    /// while typing, so an idle agent costs nothing.
+    pub fn take_recheck_due(&mut self) -> bool {
+        std::mem::take(&mut self.typed_since_check)
     }
 
     /// The output stream is gone; `status` must not report the old device.
@@ -199,9 +214,6 @@ pub fn recheck_while_listening(fresh_granted: bool, marked_denied: bool) -> Rech
     }
 }
 
-/// Re-verify access every this many ticks while listening (~30 s).
-const RECHECK_EVERY_TICKS: u32 = 15;
-
 enum AgentMsg {
     Input(InputMsg),
     Ipc(Request, mpsc::Sender<Response>),
@@ -228,7 +240,6 @@ struct Agent {
     output: Option<AudioOutput>,
     loaded: Option<LoadedStyle>,
     listening: bool,
-    ticks: u32,
     variant: usize,
     reexecs: u32,
     audio_log: Dedup,
@@ -245,7 +256,7 @@ impl Agent {
             }
             return;
         }
-        log(format!("{why}; restarting to apply it"));
+        log(format!("{why}; restarting the agent to apply it"));
         log(format!("restart failed: {}", reexec(self.reexecs)));
     }
 
@@ -303,19 +314,20 @@ impl Agent {
         match recheck_while_listening(fresh_process_granted(), marked_denied) {
             Recheck::Fine => {}
             Recheck::MarkDenied => {
-                if !marked_denied {
-                    log("Input Monitoring permission was revoked; waiting for it to be granted again");
-                }
                 self.state.set_permission(Access::Denied);
+                if !marked_denied {
+                    // macOS keeps feeding keys to an already-open listener;
+                    // restart so this process stops seeing them at all.
+                    self.restart_for_permission("Input Monitoring permission was revoked");
+                }
             }
             Recheck::Restart => self.restart_for_permission("Input Monitoring permission granted again"),
         }
     }
 
     fn tick_input(&mut self) {
-        self.ticks = self.ticks.wrapping_add(1);
         if self.listening {
-            if self.ticks.is_multiple_of(RECHECK_EVERY_TICKS) {
+            if self.state.take_recheck_due() {
                 self.recheck_permission();
             }
             return;
@@ -443,7 +455,6 @@ pub fn run(reexecs: u32) -> Result<()> {
         output: None,
         loaded: None,
         listening: false,
-        ticks: 0,
         variant: 0,
         reexecs,
         audio_log: Dedup::default(),
@@ -476,6 +487,13 @@ mod tests {
     use crate::filter::Mode;
     use crate::input::{KeyAction, KeyEvent, KeySource};
 
+    /// Agent state as it is while listening: permission granted.
+    fn granted() -> AgentState {
+        let mut s = AgentState::new(Config::default());
+        s.set_permission(Access::Granted);
+        s
+    }
+
     fn key(source: KeySource, action: KeyAction) -> InputMsg {
         InputMsg::Key(KeyEvent {
             source,
@@ -486,7 +504,7 @@ mod tests {
 
     #[test]
     fn audio_lost_clears_device() {
-        let mut s = AgentState::new(Config::default());
+        let mut s = granted();
         s.set_audio_device(Some("MacBook Pro Speakers".into()));
         s.audio_lost();
         assert_eq!(s.status().audio_device, None);
@@ -516,16 +534,35 @@ mod tests {
     }
 
     #[test]
-    fn status_tracks_permission_while_keys_keep_flowing() {
+    fn no_sound_unless_permission_granted() {
+        // Turning Input Monitoring off must silence the agent even if macOS
+        // keeps delivering keys to an already-open listener.
         let mut s = AgentState::new(Config::default());
-        s.set_permission(Access::Denied);
-        assert_eq!(s.status().permission, Access::Denied);
+        for access in [Access::Denied, Access::Unknown] {
+            s.set_permission(access);
+            assert_eq!(s.status().permission, access);
+            assert_eq!(s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)), None);
+            assert_eq!(s.handle_input(key(KeySource::BuiltIn, KeyAction::Up)), None);
+        }
+        s.set_permission(Access::Granted);
         assert_eq!(
             s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)),
             Some(Sound::Press)
         );
-        s.set_permission(Access::Granted);
-        assert_eq!(s.status().permission, Access::Granted);
+    }
+
+    #[test]
+    fn recheck_due_only_after_typing() {
+        let mut s = granted();
+        assert!(!s.take_recheck_due(), "idle: no checks");
+        s.handle_input(key(KeySource::BuiltIn, KeyAction::Down));
+        assert!(s.take_recheck_due());
+        assert!(!s.take_recheck_due(), "one check per burst of typing");
+        s.handle_input(InputMsg::Devices {
+            builtin: 1,
+            external: 0,
+        });
+        assert!(!s.take_recheck_due(), "device changes aren't typing");
     }
 
     #[test]
@@ -588,7 +625,7 @@ mod tests {
 
     #[test]
     fn devices_msg_updates_external_flag() {
-        let mut s = AgentState::new(Config::default());
+        let mut s = granted();
         assert_eq!(
             s.handle_input(InputMsg::Devices {
                 builtin: 1,
@@ -606,7 +643,7 @@ mod tests {
 
     #[test]
     fn apply_config_changes_style_and_mode() {
-        let mut s = AgentState::new(Config::default());
+        let mut s = granted();
         s.apply_config(&Config {
             style: "thocky".into(),
             volume: 20,
@@ -624,7 +661,7 @@ mod tests {
 
     #[test]
     fn builtin_key_produces_press() {
-        let mut s = AgentState::new(Config::default());
+        let mut s = granted();
         assert_eq!(
             s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)),
             Some(Sound::Press)
@@ -638,7 +675,7 @@ mod tests {
 
     #[test]
     fn status_reports_audio_device() {
-        let mut s = AgentState::new(Config::default());
+        let mut s = granted();
         s.set_audio_device(Some("MacBook Pro Speakers".into()));
         assert_eq!(s.status().audio_device.as_deref(), Some("MacBook Pro Speakers"));
     }
