@@ -4,7 +4,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow};
@@ -87,14 +91,21 @@ pub fn open_outcome(ret: IOReturn) -> OpenOutcome {
 }
 
 struct Ctx {
-    tx: Sender<InputMsg>,
+    tx: SyncSender<InputMsg>,
+    overflow: Arc<AtomicBool>,
     devices: DeviceRegistry,
+    trace: bool,
 }
 
 impl Ctx {
     fn send_counts(&self) {
         let (builtin, external) = self.devices.counts();
-        let _ = self.tx.send(InputMsg::Devices { builtin, external });
+        self.send(InputMsg::Devices { builtin, external });
+    }
+    fn send(&self, msg: InputMsg) {
+        if self.tx.try_send(msg).is_err() {
+            self.overflow.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -128,36 +139,54 @@ fn device_info(device: IOHIDDeviceRef) -> DeviceInfo {
     }
 }
 
+// SAFETY: only native callbacks call this. The owning listener thread keeps
+// the Box alive until callbacks are unscheduled/closed; references never escape
+// an invocation, and no other thread accesses its RefCell.
 unsafe fn ctx<'a>(context: *mut c_void) -> &'a RefCell<Ctx> {
     unsafe { &*(context as *const RefCell<Ctx>) }
 }
 
 unsafe extern "C" fn on_match(context: *mut c_void, _r: IOReturn, _s: *mut c_void, device: IOHIDDeviceRef) {
+    if context.is_null() || device.is_null() || _r != 0 {
+        return;
+    }
     let ctx = unsafe { ctx(context) };
     let info = device_info(device);
     let source = classify(&info);
-    let mut c = ctx.borrow_mut();
+    let Ok(mut c) = ctx.try_borrow_mut() else { return };
     c.devices.matched(device as usize, source);
-    let _ = c.tx.send(InputMsg::DeviceSeen { info, source });
+    c.send(InputMsg::DeviceSeen { info, source });
     c.send_counts();
 }
 
 unsafe extern "C" fn on_remove(context: *mut c_void, _r: IOReturn, _s: *mut c_void, device: IOHIDDeviceRef) {
+    if context.is_null() || device.is_null() || _r != 0 {
+        return;
+    }
     let ctx = unsafe { ctx(context) };
-    let mut c = ctx.borrow_mut();
+    let Ok(mut c) = ctx.try_borrow_mut() else { return };
     c.devices.removed(device as usize);
     c.send_counts();
 }
 
 unsafe extern "C" fn on_value(context: *mut c_void, _r: IOReturn, _s: *mut c_void, value: IOHIDValueRef) {
+    if context.is_null() || value.is_null() || _r != 0 {
+        return;
+    }
     let ctx = unsafe { ctx(context) };
     let element = unsafe { IOHIDValueGetElement(value) };
+    if element.is_null() {
+        return;
+    }
     let (page, usage) = unsafe { (IOHIDElementGetUsagePage(element), IOHIDElementGetUsage(element)) };
     if !is_key_usage(page, usage) {
         return;
     }
     let device = unsafe { IOHIDElementGetDevice(element) };
-    let c = ctx.borrow();
+    if device.is_null() {
+        return;
+    }
+    let Ok(c) = ctx.try_borrow() else { return };
     let source = c
         .devices
         .source_of(device as usize)
@@ -167,10 +196,10 @@ unsafe extern "C" fn on_value(context: *mut c_void, _r: IOReturn, _s: *mut c_voi
     } else {
         KeyAction::Up
     };
-    if std::env::var_os("RUSTIC_KEYS_TRACE").is_some() {
+    if c.trace {
         trace_delivery(unsafe { IOHIDValueGetTimeStamp(value) });
     }
-    let _ = c.tx.send(InputMsg::Key(KeyEvent { source, action, usage }));
+    c.send(InputMsg::Key(KeyEvent { source, action, usage }));
 }
 
 /// Diagnostics: how long after the hardware event this callback ran.
@@ -185,24 +214,54 @@ fn trace_delivery(event_ticks: u64) {
     eprintln!("[trace] HID delivery {:.2} ms", ns as f64 / 1e6);
 }
 
-/// Start the listener on its own thread with its own run loop. Returns once
-/// the HID manager is open (or with the error that prevented it).
-pub fn spawn_listener(tx: Sender<InputMsg>) -> Result<JoinHandle<()>> {
+/// An owned listener. Cancellation is observed on its own run loop within 100 ms.
+/// Native startup is asynchronous: a wedged native open cannot block status or
+/// trigger overlapping retries. Never free callback context from another thread.
+pub struct Listener {
+    stop: Arc<AtomicBool>,
+    overflow: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
+    ready: mpsc::Receiver<Result<()>>,
+}
+impl Listener {
+    pub fn ready(&self) -> Option<Result<()>> {
+        self.ready.try_recv().ok()
+    }
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+    pub fn take_overflow(&self) -> bool {
+        self.overflow.swap(false, Ordering::Relaxed)
+    }
+}
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+pub fn spawn_listener(tx: SyncSender<InputMsg>) -> Result<Listener> {
     let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let overflow_thread = overflow.clone();
     let handle = std::thread::Builder::new()
         .name("hid-listener".into())
         .spawn(move || {
-            // Owned by the run loop for the life of the process; freed only if
-            // opening fails below.
-            let ctx_ptr = Box::into_raw(Box::new(RefCell::new(Ctx {
+            let context_owner = Box::new(RefCell::new(Ctx {
                 tx,
+                overflow: overflow_thread,
                 devices: DeviceRegistry::default(),
-            })));
-            let context = ctx_ptr as *mut c_void;
+                trace: std::env::var_os("RUSTIC_KEYS_TRACE").is_some(),
+            }));
+            let context = (&*context_owner as *const RefCell<Ctx>) as *mut c_void;
             unsafe {
                 let manager = IOHIDManagerCreate(std::ptr::null(), kIOHIDManagerOptionNone);
                 if manager.is_null() {
-                    drop(Box::from_raw(ctx_ptr));
                     let _ = ready_tx.send(Err(anyhow!("IOHIDManagerCreate failed")));
                     return;
                 }
@@ -234,19 +293,41 @@ pub fn spawn_listener(tx: Sender<InputMsg>) -> Result<JoinHandle<()>> {
                             CFRunLoop::get_current().as_concrete_TypeRef(),
                             kCFRunLoopDefaultMode,
                         );
+                        IOHIDManagerClose(manager, kIOHIDOptionsTypeNone);
                         CFRelease(manager as CFTypeRef);
-                        drop(Box::from_raw(ctx_ptr));
                         let _ = ready_tx.send(Err(anyhow!("IOHIDManagerOpen: not permitted (0x{ret:08x})")));
                         return;
                     }
                 }
                 let _ = ready_tx.send(Ok(()));
-                CFRunLoop::run_current();
+                while !stop_thread.load(Ordering::Relaxed) {
+                    use core_foundation::runloop::{CFRunLoopRunInMode, kCFRunLoopRunFinished, kCFRunLoopRunStopped};
+                    let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false as _);
+                    if result == kCFRunLoopRunFinished || result == kCFRunLoopRunStopped {
+                        break;
+                    }
+                }
+                // All callbacks run on this thread. Unschedule/close/release
+                // before dropping context_owner; no callback can outlive it.
+                IOHIDManagerUnscheduleFromRunLoop(
+                    manager,
+                    CFRunLoop::get_current().as_concrete_TypeRef(),
+                    kCFRunLoopDefaultMode,
+                );
+                IOHIDManagerRegisterInputValueCallback(manager, None, std::ptr::null_mut());
+                IOHIDManagerRegisterDeviceMatchingCallback(manager, None, std::ptr::null_mut());
+                IOHIDManagerRegisterDeviceRemovalCallback(manager, None, std::ptr::null_mut());
+                IOHIDManagerClose(manager, kIOHIDOptionsTypeNone);
+                CFRelease(manager as CFTypeRef);
             }
         })
         .context("spawning HID listener thread")?;
-    ready_rx.recv().context("HID listener thread exited early")??;
-    Ok(handle)
+    Ok(Listener {
+        stop,
+        overflow,
+        handle,
+        ready: ready_rx,
+    })
 }
 
 #[cfg(test)]

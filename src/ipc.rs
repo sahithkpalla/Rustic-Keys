@@ -1,25 +1,28 @@
-//! Control protocol between the CLI and the agent: one JSON line per
-//! request, one JSON line per response, over a Unix socket.
-
-use std::io::{BufRead, BufReader, Write};
+//! Bounded newline JSON control protocol. One nonblocking server thread, at most
+//! eight peers, 1 KiB requests / 8 KiB replies, and absolute I/O deadlines.
+use crate::filter::Mode;
+use crate::input::permission::Access;
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-
-use crate::filter::Mode;
-use crate::input::permission::Access;
+pub const MAX_REQUEST: usize = 1024;
+pub const MAX_REPLY: usize = 8192;
+pub const MAX_PEERS: usize = 8;
+pub const PEER_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
-#[serde(tag = "cmd", rename_all = "snake_case")]
+#[serde(tag = "cmd", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Reload,
     Status,
 }
-
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StatusReport {
     pub style: String,
@@ -29,7 +32,6 @@ pub struct StatusReport {
     pub external_keyboard_connected: bool,
     pub audio_device: Option<String>,
 }
-
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
@@ -37,139 +39,337 @@ pub enum Response {
     Status(StatusReport),
     Error { message: String },
 }
-
-/// `bind` found a live agent already answering on the socket.
 #[derive(Debug)]
 pub struct AlreadyRunning(pub std::path::PathBuf);
-
 impl std::fmt::Display for AlreadyRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "another agent is already listening on {}", self.0.display())
     }
 }
-
 impl std::error::Error for AlreadyRunning {}
 
-/// Bind the agent socket. A leftover socket file from a dead agent is
-/// replaced; if a live agent answers, binding fails.
-pub fn bind(path: &Path) -> Result<UnixListener> {
-    if path.exists() {
-        if UnixStream::connect(path).is_ok() {
-            return Err(AlreadyRunning(path.to_path_buf()).into());
+fn same_user(s: &UnixStream) -> Result<()> {
+    let (mut uid, mut gid) = (0, 0);
+    if unsafe { libc::getpeereid(s.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    ensure!(
+        uid == unsafe { libc::geteuid() },
+        "control peer is not owned by this user"
+    );
+    Ok(())
+}
+fn socket_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => {
+            ensure!(
+                m.file_type().is_socket() && m.uid() == unsafe { libc::geteuid() },
+                "refusing non-socket, symlink or foreign socket at {}",
+                path.display()
+            );
+            Ok(Some(m))
         }
-        std::fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
 }
 
-/// Serve requests forever on a background thread, one connection at a time.
+fn wait(fd: i32, events: i16, deadline: Instant) -> Result<()> {
+    loop {
+        let left = deadline
+            .checked_duration_since(Instant::now())
+            .context("IPC overall deadline exceeded")?;
+        let mut p = libc::pollfd { fd, events, revents: 0 };
+        let n = unsafe { libc::poll(&mut p, 1, left.as_millis().max(1).min(i32::MAX as u128) as i32) };
+        if n > 0 {
+            return Ok(());
+        }
+        if n == 0 {
+            bail!("IPC overall deadline exceeded")
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e.into());
+        }
+    }
+}
+/// Nonblocking connect includes full-backlog stalls in the caller's deadline.
+fn connect(path: &Path, deadline: Instant) -> Result<UnixStream> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as _;
+    let bytes = path.as_os_str().as_bytes();
+    ensure!(
+        bytes.len() < addr.sun_path.len() && !bytes.contains(&0),
+        "invalid or overlong socket path"
+    );
+    for (a, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *a = *b as _
+    }
+    addr.sun_len = std::mem::size_of_val(&addr) as _;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let s = unsafe { UnixStream::from_raw_fd(fd) };
+    s.set_nonblocking(true)?;
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if unsafe {
+        libc::connect(
+            fd,
+            (&addr as *const libc::sockaddr_un).cast(),
+            std::mem::size_of_val(&addr) as _,
+        )
+    } != 0
+    {
+        let e = std::io::Error::last_os_error();
+        if !matches!(e.raw_os_error(), Some(libc::EINPROGRESS) | Some(libc::EAGAIN)) {
+            return Err(e.into());
+        }
+        wait(fd, libc::POLLOUT, deadline)?;
+        let mut error: i32 = 0;
+        let mut len = std::mem::size_of_val(&error) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut error as *mut i32).cast(),
+                &mut len,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if error != 0 {
+            return Err(std::io::Error::from_raw_os_error(error).into());
+        }
+    }
+    same_user(&s)?;
+    Ok(s)
+}
+
+pub fn bind(path: &Path) -> Result<UnixListener> {
+    let _dir = crate::state_files::PrivateDir::open(path.parent().context("socket has no parent")?)?;
+    if let Some(m) = socket_metadata(path)? {
+        match connect(path, Instant::now() + Duration::from_millis(150)) {
+            Ok(_) => return Err(AlreadyRunning(path.into()).into()),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| matches!(e.raw_os_error(), Some(libc::ECONNREFUSED) | Some(libc::ENOENT))) =>
+            {
+                let now = socket_metadata(path)?.context("socket changed during stale check")?;
+                ensure!(
+                    (m.dev(), m.ino()) == (now.dev(), now.ino()),
+                    "socket changed during stale check"
+                );
+                std::fs::remove_file(path)?;
+            }
+            Err(e) => return Err(e.context("cannot prove existing socket stale")),
+        }
+    }
+    let l = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    l.set_nonblocking(true)?;
+    Ok(l)
+}
+
+struct Peer {
+    stream: UnixStream,
+    deadline: Instant,
+    input: Vec<u8>,
+    output: Option<Vec<u8>>,
+    sent: usize,
+}
+fn reply(r: Response) -> Vec<u8> {
+    let mut b = serde_json::to_vec(&r).unwrap_or_default();
+    if b.len() + 1 > MAX_REPLY {
+        b = br#"{"result":"error","message":"reply too large"}"#.to_vec()
+    }
+    b.push(b'\n');
+    b
+}
+fn read_frame(s: &mut UnixStream, bytes: &mut Vec<u8>, limit: usize) -> Result<bool> {
+    let mut buf = [0; 1024];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => bail!("disconnected before complete frame"),
+            Ok(n) => {
+                let end = buf[..n].iter().position(|b| *b == b'\n');
+                let n = end.map_or(n, |i| i + 1);
+                ensure!(bytes.len() + n <= limit, "frame too large");
+                bytes.extend_from_slice(&buf[..n]);
+                if end.is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+/// The handler must itself be bounded; the daemon uses a bounded queue and a
+/// 100 ms reply wait. Saturation closes excess peers, without allocating tasks.
 pub fn serve(listener: UnixListener, mut handler: impl FnMut(Request) -> Response + Send + 'static) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut line = String::new();
-            if BufReader::new(&stream).read_line(&mut line).is_err() {
+        let mut peers: Vec<Peer> = Vec::with_capacity(MAX_PEERS);
+        loop {
+            let mut polls = Vec::with_capacity(MAX_PEERS + 1);
+            polls.push(libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            for p in &peers {
+                polls.push(libc::pollfd {
+                    fd: p.stream.as_raw_fd(),
+                    events: if p.output.is_some() {
+                        libc::POLLOUT
+                    } else {
+                        libc::POLLIN
+                    },
+                    revents: 0,
+                })
+            }
+            let timeout = peers
+                .iter()
+                .map(|p| p.deadline.saturating_duration_since(Instant::now()).as_millis().max(1) as i32)
+                .min()
+                .unwrap_or(-1);
+            if unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as _, timeout) } < 0 {
                 continue;
             }
-            let response = match serde_json::from_str::<Request>(line.trim()) {
-                Ok(req) => handler(req),
-                Err(e) => Response::Error {
-                    message: format!("bad request: {e}"),
-                },
-            };
-            let mut stream = stream;
-            if let Ok(mut text) = serde_json::to_string(&response) {
-                text.push('\n');
-                let _ = stream.write_all(text.as_bytes());
+            // Bound accept work too, so a connection flood cannot starve existing peers.
+            if polls[0].revents != 0 {
+                for _ in 0..MAX_PEERS {
+                    match listener.accept() {
+                        Ok((s, _)) => {
+                            if peers.len() < MAX_PEERS && same_user(&s).is_ok() && s.set_nonblocking(true).is_ok() {
+                                peers.push(Peer {
+                                    stream: s,
+                                    deadline: Instant::now() + PEER_TIMEOUT,
+                                    input: Vec::new(),
+                                    output: None,
+                                    sent: 0,
+                                })
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
+            peers.retain_mut(|p| {
+                if Instant::now() >= p.deadline {
+                    return false;
+                }
+                if p.output.is_none() {
+                    match read_frame(&mut p.stream, &mut p.input, MAX_REQUEST) {
+                        Ok(false) => return true,
+                        Ok(true) => {
+                            p.output = Some(reply(match serde_json::from_slice(&p.input) {
+                                Ok(r) => handler(r),
+                                Err(_) => Response::Error {
+                                    message: "malformed request".into(),
+                                },
+                            }))
+                        }
+                        Err(_) => return false,
+                    }
+                }
+                if Instant::now() >= p.deadline {
+                    return false;
+                }
+                let b = p.output.as_ref().unwrap();
+                match p.stream.write(&b[p.sent..]) {
+                    Ok(0) => false,
+                    Ok(n) => {
+                        p.sent += n;
+                        p.sent < b.len()
+                    }
+                    Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+                }
+            });
         }
     })
 }
 
-/// Send one request to the agent and wait (up to `timeout`) for its reply.
+fn write_frame(s: &mut UnixStream, bytes: &[u8], deadline: Instant) -> Result<()> {
+    let mut sent = 0;
+    while sent < bytes.len() {
+        wait(s.as_raw_fd(), libc::POLLOUT, deadline)?;
+        match s.write(&bytes[sent..]) {
+            Ok(0) => bail!("peer disconnected"),
+            Ok(n) => sent += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 pub fn send(path: &Path, req: &Request, timeout: Duration) -> Result<Response> {
-    let mut stream = UnixStream::connect(path).with_context(|| format!("agent not reachable at {}", path.display()))?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
-    let mut text = serde_json::to_string(req)?;
-    text.push('\n');
-    stream.write_all(text.as_bytes())?;
-    let mut line = String::new();
-    BufReader::new(&stream)
-        .read_line(&mut line)
-        .context("reading agent reply")?;
-    serde_json::from_str(line.trim()).context("parsing agent reply")
+    let deadline = Instant::now() + timeout;
+    let _dir = crate::state_files::PrivateDir::open(path.parent().context("socket has no parent")?)?;
+    socket_metadata(path)?.context("agent socket absent")?;
+    let mut s = connect(path, deadline).with_context(|| format!("agent not reachable at {}", path.display()))?;
+    let mut b = serde_json::to_vec(req)?;
+    b.push(b'\n');
+    ensure!(b.len() <= MAX_REQUEST, "request too large");
+    write_frame(&mut s, &b, deadline)?;
+    let mut bytes = Vec::new();
+    loop {
+        wait(s.as_raw_fd(), libc::POLLIN, deadline)?;
+        if read_frame(&mut s, &mut bytes, MAX_REPLY)? {
+            break;
+        }
+    }
+    ensure!(Instant::now() <= deadline, "IPC overall deadline exceeded");
+    serde_json::from_slice(&bytes).context("parsing agent reply")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const T: Duration = Duration::from_secs(2);
-
-    fn report() -> StatusReport {
-        StatusReport {
-            style: "thocky".into(),
-            volume: 55,
-            mode: Mode::PerKey,
-            permission: Access::Granted,
-            external_keyboard_connected: true,
-            audio_device: Some("MacBook Pro Speakers".into()),
+    #[test]
+    fn stalled_write_obeys_the_same_absolute_deadline() {
+        let (mut writer, _not_reading) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        loop {
+            match writer.write(&[b'x'; 8192]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
         }
+        let now = Instant::now();
+        assert!(write_frame(&mut writer, b"x", now + Duration::from_millis(40)).is_err());
+        assert!(now.elapsed() < Duration::from_millis(250));
     }
-
     #[test]
-    fn status_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.sock");
-        serve(bind(&path).unwrap(), |req| match req {
-            Request::Status => Response::Status(report()),
-            Request::Reload => Response::Ok,
-        });
-        assert_eq!(send(&path, &Request::Status, T).unwrap(), Response::Status(report()));
-        // Server keeps serving after the first connection.
-        assert_eq!(send(&path, &Request::Status, T).unwrap(), Response::Status(report()));
+    fn roundtrip_and_duplicate() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a.sock");
+        serve(bind(&p).unwrap(), |_| Response::Ok);
+        assert_eq!(
+            send(&p, &Request::Status, Duration::from_secs(1)).unwrap(),
+            Response::Ok
+        );
+        assert!(bind(&p).unwrap_err().downcast_ref::<AlreadyRunning>().is_some());
     }
-
     #[test]
-    fn reload_returns_ok() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.sock");
-        serve(bind(&path).unwrap(), |_| Response::Ok);
-        assert_eq!(send(&path, &Request::Reload, T).unwrap(), Response::Ok);
-    }
-
-    #[test]
-    fn send_without_server_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(send(&dir.path().join("none.sock"), &Request::Status, T).is_err());
-    }
-
-    #[test]
-    fn bind_replaces_stale_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.sock");
-        std::fs::write(&path, b"stale").unwrap();
-        assert!(bind(&path).is_ok());
-    }
-
-    #[test]
-    fn bind_refuses_when_live() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.sock");
-        serve(bind(&path).unwrap(), |_| Response::Ok);
-        let err = bind(&path).unwrap_err();
-        assert!(err.downcast_ref::<AlreadyRunning>().is_some(), "{err:#}");
-    }
-
-    #[test]
-    fn bind_other_failures_are_not_already_running() {
-        let dir = tempfile::tempdir().unwrap();
-        let long = dir.path().join("x".repeat(120)).join("a.sock");
-        let err = bind(&long).unwrap_err();
-        assert!(err.downcast_ref::<AlreadyRunning>().is_none(), "{err:#}");
+    fn stale_socket_and_malformed_path() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a.sock");
+        drop(UnixListener::bind(&p).unwrap());
+        assert!(bind(&p).is_ok());
+        let p = d.path().join("file");
+        std::fs::write(&p, b"KEEP").unwrap();
+        assert!(bind(&p).is_err());
+        assert_eq!(std::fs::read(p).unwrap(), b"KEEP");
     }
 }

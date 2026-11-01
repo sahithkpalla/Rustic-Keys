@@ -1,7 +1,7 @@
 //! The background agent launched by launchd (`rustic-keys daemon`).
 
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
@@ -21,7 +21,6 @@ pub struct AgentState {
     external_connected: bool,
     permission: Access,
     audio_device: Option<String>,
-    typed_since_check: bool,
 }
 
 impl AgentState {
@@ -33,14 +32,12 @@ impl AgentState {
             external_connected: false,
             permission: Access::Unknown,
             audio_device: None,
-            typed_since_check: false,
         }
     }
 
     pub fn handle_input(&mut self, msg: InputMsg) -> Option<Sound> {
         match msg {
             InputMsg::Key(ev) => {
-                self.typed_since_check = true;
                 // Only sound while we're allowed to see keys at all.
                 if self.permission != Access::Granted {
                     return None;
@@ -48,6 +45,9 @@ impl AgentState {
                 self.filter.decide(&ev)
             }
             InputMsg::Devices { external, .. } => {
+                // Disconnect/reconnect can lose an Up even if the aggregate
+                // external-presence flag is unchanged.
+                self.filter.clear_held();
                 self.external_connected = external > 0;
                 self.filter.set_external_connected(self.external_connected);
                 None
@@ -62,17 +62,14 @@ impl AgentState {
     }
 
     pub fn set_permission(&mut self, a: Access) {
+        if self.permission != a {
+            self.filter.clear_held();
+        }
         self.permission = a;
     }
 
     pub fn set_audio_device(&mut self, name: Option<String>) {
         self.audio_device = name;
-    }
-
-    /// Has a key arrived since the last call? Permission is re-verified only
-    /// while typing, so an idle agent costs nothing.
-    pub fn take_recheck_due(&mut self) -> bool {
-        std::mem::take(&mut self.typed_since_check)
     }
 
     /// The output stream is gone; `status` must not report the old device.
@@ -102,35 +99,22 @@ impl AgentState {
     }
 }
 
-/// What to do about keyboard access on a tick, before listening has started.
-#[derive(Debug, PartialEq, Eq)]
-pub enum PermissionStep {
-    /// Access is usable in this process: start the HID listener.
-    Listen,
-    /// Granted, but only a fresh process can use it (macOS caches the
-    /// decision per process): re-exec the agent.
-    Restart,
-    Wait,
-}
-
-pub fn permission_step(in_process: Access, fresh_process_granted: impl FnOnce() -> bool) -> PermissionStep {
-    if in_process == Access::Granted {
-        PermissionStep::Listen
-    } else if fresh_process_granted() {
-        PermissionStep::Restart
-    } else {
-        PermissionStep::Wait
+/// Ask a brand-new process (same binary, so same permission identity).
+fn fresh_process_access() -> Access {
+    let result = (|| -> Result<_> {
+        crate::process::output(
+            std::process::Command::new(std::env::current_exe()?).arg("check-access"),
+            Duration::from_millis(300),
+        )
+    })();
+    match result {
+        Ok(o) if o.status.success() => Access::Granted,
+        Ok(o) if o.status.code() == Some(1) => Access::Denied,
+        _ => Access::Unknown,
     }
 }
 
-/// Ask a brand-new process (same binary, so same permission identity).
-fn fresh_process_granted() -> bool {
-    std::env::current_exe()
-        .and_then(|exe| std::process::Command::new(exe).arg("check-access").status())
-        .is_ok_and(|s| s.success())
-}
-
-/// Consecutive self-restarts allowed before giving up, so a disagreement
+/// Lifetime self-restarts allowed before giving up, so a disagreement
 /// between the fresh-process check and the restarted agent can't loop.
 pub const MAX_REEXECS: u32 = 3;
 
@@ -182,48 +166,29 @@ impl Dedup {
     }
 }
 
-/// launchd appends to the log forever; start fresh when it gets big.
+/// Runtime cap for the daemon-owned log (not launchd's inherited descriptors).
 pub const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
-pub fn trim_log(path: &std::path::Path, max_bytes: u64) -> std::io::Result<bool> {
-    match std::fs::metadata(path) {
-        Ok(m) if m.len() > max_bytes => {
-            std::fs::OpenOptions::new().write(true).open(path)?.set_len(0)?;
-            Ok(true)
-        }
-        Ok(_) => Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// While listening: what a fresh-process access check means. A revocation
-/// stops input silently, and a later re-grant only works in a new process.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Recheck {
-    Fine,
-    MarkDenied,
-    Restart,
-}
-
-pub fn recheck_while_listening(fresh_granted: bool, marked_denied: bool) -> Recheck {
-    match (fresh_granted, marked_denied) {
-        (false, _) => Recheck::MarkDenied,
-        (true, true) => Recheck::Restart,
-        (true, false) => Recheck::Fine,
-    }
+pub fn trim_log(path: &std::path::Path, max_bytes: u64) -> Result<bool> {
+    crate::state_files::trim_log(path, max_bytes)
 }
 
 enum AgentMsg {
-    Input(InputMsg),
+    Input(u64, InputMsg),
     Ipc(Request, mpsc::Sender<Response>),
-    Tick,
 }
 
 const TICK: Duration = Duration::from_secs(2);
 
 fn log(msg: impl std::fmt::Display) {
-    eprintln!("[rustic-keys] {msg}");
+    let text = format!("[rustic-keys] {msg}\n");
+    // Not called per key. A single agent owns this file, not launchd. Refuse
+    // links and cap runtime growth, not only startup size.
+    let result =
+        (|| -> Result<()> { crate::state_files::append_log(&config::log_path()?, text.as_bytes(), MAX_LOG_BYTES) })();
+    if let Err(e) = result {
+        eprintln!("logging refused: {e:#}");
+    }
 }
 
 fn style_or_default(name: &str) -> &'static Style {
@@ -236,7 +201,7 @@ fn style_or_default(name: &str) -> &'static Style {
 /// Mutable pieces of the running agent outside the testable `AgentState`.
 struct Agent {
     state: AgentState,
-    tx: mpsc::Sender<AgentMsg>,
+    tx: mpsc::SyncSender<AgentMsg>,
     output: Option<AudioOutput>,
     loaded: Option<LoadedStyle>,
     listening: bool,
@@ -244,7 +209,15 @@ struct Agent {
     reexecs: u32,
     audio_log: Dedup,
     input_log: Dedup,
-    probe_log: Dedup,
+    listener: Option<hid::Listener>,
+    epoch: u64,
+    fresh: Access,
+    fresh_until: Instant,
+    pause_log: Dedup,
+    helper: Option<mpsc::Receiver<Access>>,
+    next_helper: Instant,
+    next_input: Instant,
+    next_audio: Instant,
 }
 
 impl Agent {
@@ -258,7 +231,9 @@ impl Agent {
             return;
         }
         log(format!("{why}; restarting the agent to apply it"));
-        log(format!("restart failed: {}", reexec(self.reexecs)));
+        let count = self.reexecs;
+        self.reexecs += 1;
+        log(format!("restart failed: {}", reexec(count)));
     }
 
     fn reload_samples(&mut self) -> Response {
@@ -270,6 +245,15 @@ impl Agent {
     }
 
     fn tick_audio(&mut self) {
+        if Instant::now() < self.next_audio {
+            return;
+        }
+        if self.state.permission != Access::Granted || self.state.gain() == 0.0 {
+            self.output = None;
+            self.loaded = None;
+            self.state.audio_lost();
+            return;
+        }
         let rebuilt = match self.output.as_mut() {
             None => match AudioOutput::start() {
                 Ok(o) => {
@@ -278,6 +262,7 @@ impl Agent {
                     true
                 }
                 Err(e) => {
+                    self.next_audio = Instant::now() + Duration::from_secs(10);
                     let msg = format!("audio unavailable: {e:#}");
                     if self.audio_log.changed(&msg) {
                         log(msg);
@@ -288,6 +273,7 @@ impl Agent {
             Some(o) => match o.check_device() {
                 Ok(rebuilt) => rebuilt,
                 Err(e) => {
+                    self.next_audio = Instant::now() + Duration::from_secs(10);
                     let msg = format!("audio rebuild failed: {e:#}");
                     if self.audio_log.changed(&msg) {
                         log(msg);
@@ -305,67 +291,135 @@ impl Agent {
                 log(message);
             }
         }
-        if let Some(o) = self.output.as_mut() {
-            o.pause_if_idle();
-        }
     }
 
-    fn recheck_permission(&mut self) {
-        let marked_denied = self.state.status().permission == Access::Denied;
-        match recheck_while_listening(fresh_process_granted(), marked_denied) {
-            Recheck::Fine => {}
-            Recheck::MarkDenied => {
-                self.state.set_permission(Access::Denied);
-                if !marked_denied {
-                    // macOS keeps feeding keys to an already-open listener;
-                    // restart so this process stops seeing them at all.
-                    self.restart_for_permission("Input Monitoring permission was revoked");
-                }
-            }
-            Recheck::Restart => self.restart_for_permission("Input Monitoring permission granted again"),
+    fn silence_listener(&mut self, access: Access) {
+        self.state.set_permission(access);
+        self.state.filter.clear_held();
+        if self.listening {
+            self.epoch = self.epoch.wrapping_add(1);
+            self.output = None;
+            self.loaded = None;
+            self.state.audio_lost();
+        }
+        self.listening = false;
+        if let Some(l) = &self.listener {
+            l.stop();
         }
     }
 
     fn tick_input(&mut self) {
-        if self.listening {
-            // Diagnostic: does the cheap in-process check notice a revoke?
-            let in_process = format!("in-process permission check while listening: {:?}", permission::check());
-            if self.probe_log.changed(&in_process) {
-                log(in_process);
+        let now = Instant::now();
+        if let Some(rx) = &self.helper {
+            match rx.try_recv() {
+                Ok(a) => {
+                    self.fresh = a;
+                    self.fresh_until = now + Duration::from_secs(12);
+                    self.helper = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.fresh = Access::Unknown;
+                    self.helper = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
-            if self.state.take_recheck_due() {
-                self.recheck_permission();
+        }
+        // One helper at a time, no more than once per ten seconds, including
+        // while idle/denied. Status requests never spawn a helper or block on it.
+        if self.helper.is_none() && now >= self.next_helper {
+            let (tx, rx) = mpsc::channel();
+            self.helper = Some(rx);
+            self.next_helper = now + Duration::from_secs(10);
+            std::thread::spawn(move || {
+                let _ = tx.send(fresh_process_access());
+            });
+        }
+        if self.listener.as_ref().is_some_and(|l| l.is_finished()) {
+            let reason = self
+                .listener
+                .as_ref()
+                .and_then(|l| l.ready())
+                .and_then(Result::err)
+                .map_or_else(
+                    || "keyboard listener exited".to_string(),
+                    |e| format!("keyboard listener failed: {e:#}"),
+                );
+            if self.input_log.changed(&reason) {
+                log(format!("{reason}; retrying in ten seconds"));
+            }
+            self.listener = None;
+            self.listening = false;
+            self.epoch = self.epoch.wrapping_add(1);
+            self.state.filter.clear_held();
+            self.state.set_permission(Access::Unknown);
+            self.next_input = now + Duration::from_secs(10);
+        }
+        // A stuck helper spawn/thread cannot leave a grant cached forever.
+        if now >= self.fresh_until {
+            self.fresh = Access::Unknown;
+        }
+        let in_process = permission::check();
+        let access = if in_process != Access::Granted {
+            in_process
+        } else {
+            self.fresh
+        };
+        if access != Access::Granted {
+            self.silence_listener(access);
+            if self.fresh == Access::Granted && self.listener.is_none() && now >= self.next_input {
+                self.next_input = now + Duration::from_secs(10);
+                self.restart_for_permission("Input Monitoring granted only to a fresh process");
             }
             return;
         }
-        let access = permission::check();
-        self.state.set_permission(access);
-        match permission_step(access, fresh_process_granted) {
-            PermissionStep::Wait => {}
-            PermissionStep::Restart => self.restart_for_permission("Input Monitoring permission granted"),
-            PermissionStep::Listen => {
-                let (in_tx, in_rx) = mpsc::channel();
-                match hid::spawn_listener(in_tx) {
-                    Ok(_) => {
+        if let Some(l) = &self.listener {
+            if l.take_overflow() {
+                self.state.filter.clear_held();
+            }
+            if let Some(result) = l.ready() {
+                match result {
+                    Ok(()) => {
                         self.listening = true;
-                        self.reexecs = 0;
                         self.input_log.clear();
                         log("listening to keyboards");
-                        let fwd = self.tx.clone();
-                        std::thread::spawn(move || {
-                            for m in in_rx {
-                                if fwd.send(AgentMsg::Input(m)).is_err() {
-                                    break;
-                                }
-                            }
-                        });
                     }
                     Err(e) => {
                         let msg = format!("keyboard listener failed: {e:#}");
                         if self.input_log.changed(&msg) {
                             log(msg);
                         }
+                        self.silence_listener(Access::Unknown);
                     }
+                }
+            }
+            if self.listening {
+                self.state.set_permission(Access::Granted);
+            }
+            return;
+        }
+        if now < self.next_input {
+            return;
+        }
+        self.next_input = now + Duration::from_secs(10);
+        let (in_tx, in_rx) = mpsc::sync_channel(256);
+        match hid::spawn_listener(in_tx) {
+            Ok(l) => {
+                self.listener = Some(l);
+                self.epoch = self.epoch.wrapping_add(1);
+                let epoch = self.epoch;
+                let fwd = self.tx.clone();
+                std::thread::spawn(move || {
+                    for m in in_rx {
+                        if fwd.send(AgentMsg::Input(epoch, m)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                let msg = format!("keyboard listener failed: {e:#}");
+                if self.input_log.changed(&msg) {
+                    log(msg);
                 }
             }
         }
@@ -378,6 +432,9 @@ impl Agent {
         let Some(sound) = self.state.handle_input(m) else {
             return;
         };
+        if self.state.gain() == 0.0 {
+            return;
+        }
         if let (Some(o), Some(l)) = (self.output.as_mut(), self.loaded.as_ref()) {
             self.variant = self.variant.wrapping_add(1);
             o.play(l.pick(sound, self.variant), self.state.gain());
@@ -386,14 +443,14 @@ impl Agent {
 
     fn on_request(&mut self, req: Request) -> Response {
         match req {
-            Request::Status => {
-                if self.listening {
-                    self.recheck_permission();
-                }
-                Response::Status(self.state.status())
-            }
+            Request::Status => Response::Status(self.state.status()),
             Request::Reload => match Config::load() {
                 Ok(c) => {
+                    if c.volume == 0 {
+                        self.output = None;
+                        self.loaded = None;
+                        self.state.audio_lost();
+                    }
                     let style_changed = c.style != self.state.config().style;
                     self.state.apply_config(&c);
                     if style_changed {
@@ -411,13 +468,10 @@ impl Agent {
 }
 
 /// Run the agent until killed. Never exits because of missing permission or
-/// a missing audio device: it keeps retrying every tick. `reexecs` counts
-/// consecutive self-restarts (see `MAX_REEXECS`).
+/// a missing audio device: native failures retry with a ten-second backoff.
+/// `reexecs` is a lifetime cap until the user explicitly starts a new agent.
 pub fn run(reexecs: u32) -> Result<()> {
-    if let Ok(true) = trim_log(&config::log_path(), MAX_LOG_BYTES) {
-        log("log was over 1 MB; started a new one");
-    }
-    let listener = match ipc::bind(&config::socket_path()) {
+    let listener = match ipc::bind(&config::socket_path()?) {
         Ok(l) => l,
         Err(e) if e.downcast_ref::<ipc::AlreadyRunning>().is_some() => {
             // Another agent is alive: exit cleanly so launchd doesn't respawn us.
@@ -427,32 +481,31 @@ pub fn run(reexecs: u32) -> Result<()> {
         // Anything else is a real failure: exit non-zero so launchd retries.
         Err(e) => return Err(e.context("binding the control socket")),
     };
-    let config = Config::load().unwrap_or_else(|e| {
-        log(format!("config unreadable ({e:#}); using defaults"));
-        Config::default()
-    });
-    let (tx, rx) = mpsc::channel::<AgentMsg>();
+    trim_log(&config::log_path()?, MAX_LOG_BYTES)?;
+    let config = Config::load()?;
+    let (tx, rx) = mpsc::sync_channel::<AgentMsg>(256);
 
     let ipc_tx = tx.clone();
     ipc::serve(listener, move |req| {
         let (reply_tx, reply_rx) = mpsc::channel();
-        if ipc_tx.send(AgentMsg::Ipc(req, reply_tx)).is_err() {
-            return Response::Error {
-                message: "agent shutting down".into(),
-            };
+        match ipc_tx.try_send(AgentMsg::Ipc(req, reply_tx)) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                return Response::Error {
+                    message: "agent busy".into(),
+                };
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Response::Error {
+                    message: "agent shutting down".into(),
+                };
+            }
         }
         reply_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_millis(100))
             .unwrap_or(Response::Error {
                 message: "agent busy".into(),
             })
-    });
-
-    let tick_tx = tx.clone();
-    std::thread::spawn(move || {
-        while tick_tx.send(AgentMsg::Tick).is_ok() {
-            std::thread::sleep(TICK);
-        }
     });
 
     let mut agent = Agent {
@@ -465,27 +518,49 @@ pub fn run(reexecs: u32) -> Result<()> {
         reexecs,
         audio_log: Dedup::default(),
         input_log: Dedup::default(),
-        probe_log: Dedup::default(),
+        listener: None,
+        epoch: 0,
+        fresh: Access::Unknown,
+        fresh_until: Instant::now(),
+        helper: None,
+        pause_log: Dedup::default(),
+        next_helper: Instant::now(),
+        next_input: Instant::now(),
+        next_audio: Instant::now(),
     };
 
+    // Preserve the one initial permission request. Later retries only check;
+    // they never prompt in a loop. Native tests interpose BOTH entry points.
     if permission::check() != Access::Granted && !permission::request() {
-        log("Input Monitoring permission missing; waiting for it to be granted");
+        log("Input Monitoring permission missing; explicitly allow rustic-keys in System Settings");
     }
-    agent.state.set_permission(permission::check());
-
-    for msg in rx {
-        match msg {
-            AgentMsg::Tick => {
-                agent.tick_audio();
-                agent.tick_input();
+    let mut next_tick = Instant::now();
+    loop {
+        if Instant::now() >= next_tick {
+            agent.tick_input();
+            agent.tick_audio();
+            if let Some(o) = agent.output.as_mut() {
+                match o.pause_if_idle() {
+                    Ok(()) => agent.pause_log.clear(),
+                    Err(e) => {
+                        let msg = format!("audio pause failed (will retry): {e:#}");
+                        if agent.pause_log.changed(&msg) {
+                            log(msg);
+                        }
+                    }
+                }
             }
-            AgentMsg::Input(m) => agent.on_input(m),
-            AgentMsg::Ipc(req, reply) => {
+            next_tick = Instant::now() + TICK;
+        }
+        match rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+            Ok(AgentMsg::Input(epoch, m)) if epoch == agent.epoch && agent.listening => agent.on_input(m),
+            Ok(AgentMsg::Ipc(req, reply)) => {
                 let _ = reply.send(agent.on_request(req));
             }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            _ => {}
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -559,52 +634,45 @@ mod tests {
     }
 
     #[test]
-    fn recheck_due_only_after_typing() {
+    fn revoke_clears_held_keys_before_regrant() {
         let mut s = granted();
-        assert!(!s.take_recheck_due(), "idle: no checks");
-        s.handle_input(key(KeySource::BuiltIn, KeyAction::Down));
-        assert!(s.take_recheck_due());
-        assert!(!s.take_recheck_due(), "one check per burst of typing");
-        s.handle_input(InputMsg::Devices {
-            builtin: 1,
-            external: 0,
-        });
-        assert!(!s.take_recheck_due(), "device changes aren't typing");
-    }
-
-    #[test]
-    fn permission_step_listens_when_granted_in_process() {
         assert_eq!(
-            permission_step(Access::Granted, || panic!("no need to ask")),
-            PermissionStep::Listen
+            s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)),
+            Some(Sound::Press)
+        );
+        s.set_permission(Access::Denied);
+        assert_eq!(s.handle_input(key(KeySource::BuiltIn, KeyAction::Up)), None);
+        s.set_permission(Access::Granted);
+        assert_eq!(
+            s.handle_input(key(KeySource::BuiltIn, KeyAction::Up)),
+            None,
+            "no stale release after recovery"
+        );
+        assert_eq!(
+            s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)),
+            Some(Sound::Press)
         );
     }
 
     #[test]
-    fn permission_step_restarts_when_granted_only_in_fresh_process() {
-        assert_eq!(permission_step(Access::Denied, || true), PermissionStep::Restart);
-        assert_eq!(permission_step(Access::Unknown, || true), PermissionStep::Restart);
-    }
-
-    #[test]
-    fn permission_step_waits_when_still_denied() {
-        assert_eq!(permission_step(Access::Denied, || false), PermissionStep::Wait);
-    }
-
-    #[test]
-    fn recheck_marks_revoked_permission_denied() {
-        assert_eq!(recheck_while_listening(false, false), Recheck::MarkDenied);
-        assert_eq!(recheck_while_listening(false, true), Recheck::MarkDenied);
-    }
-
-    #[test]
-    fn recheck_restarts_when_regranted_after_revoke() {
-        assert_eq!(recheck_while_listening(true, true), Recheck::Restart);
-    }
-
-    #[test]
-    fn recheck_fine_while_still_granted() {
-        assert_eq!(recheck_while_listening(true, false), Recheck::Fine);
+    fn device_transition_clears_a_lost_release() {
+        let mut s = granted();
+        assert_eq!(
+            s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)),
+            Some(Sound::Press)
+        );
+        s.handle_input(InputMsg::Devices {
+            builtin: 0,
+            external: 0,
+        });
+        s.handle_input(InputMsg::Devices {
+            builtin: 1,
+            external: 0,
+        });
+        assert_eq!(
+            s.handle_input(key(KeySource::BuiltIn, KeyAction::Down)),
+            Some(Sound::Press)
+        );
     }
 
     #[test]

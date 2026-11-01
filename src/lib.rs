@@ -7,4 +7,6 @@ pub mod filter;
 pub mod input;
 pub mod ipc;
 pub mod launchd;
+mod process;
+mod state_files;
 pub mod styles;

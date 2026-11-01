@@ -36,7 +36,11 @@ pub enum Command {
     Status,
     /// Print every keyboard event with the device it came from (diagnostics).
     #[command(hide = true)]
-    Probe,
+    Probe {
+        /// CONSENT: usages reveal typed content from ALL keyboards. Never type secrets or persist output.
+        #[arg(long, required = true)]
+        acknowledge_key_logging: bool,
+    },
     /// Play a style's sounds once (diagnostics).
     #[command(hide = true)]
     Demo { style: String },
@@ -46,7 +50,7 @@ pub enum Command {
     /// Run the background agent (launched by launchd).
     #[command(hide = true)]
     Daemon {
-        /// Consecutive self-restarts so far (set by the agent itself).
+        /// Lifetime permission self-restarts so far (set by the agent itself).
         #[arg(long, default_value_t = 0, hide = true)]
         reexecs: u32,
     },

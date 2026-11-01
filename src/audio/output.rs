@@ -30,6 +30,7 @@ pub struct AudioOutput {
     sample_rate: u32,
     /// (frames in last callback, callback→playback latency in µs)
     stats: Arc<(AtomicU32, AtomicU32)>,
+    callbacks: Arc<AtomicU32>,
     requested: String,
     idle: IdleTimer,
     /// Samples the audio thread is done with; dropped here, off that thread.
@@ -62,22 +63,25 @@ impl AudioOutput {
         let mut mixer = Mixer::with_retire(retire_tx);
         let stats = Arc::new((AtomicU32::new(0), AtomicU32::new(0)));
         let stats_cb = stats.clone();
+        let callbacks = Arc::new(AtomicU32::new(0));
+        let callbacks_cb = callbacks.clone();
         let requested = format!("{:?}", config.buffer_size);
         let stream = device
             .build_output_stream::<f32, _, _>(
                 config,
                 move |out, info: &cpal::OutputCallbackInfo| {
+                    callbacks_cb.fetch_add(1, Ordering::Relaxed);
                     let ts = info.timestamp();
                     let lat = ts.playback.duration_since(ts.callback);
                     stats_cb.0.store((out.len() / channels) as u32, Ordering::Relaxed);
                     stats_cb.1.store(lat.as_micros() as u32, Ordering::Relaxed);
-                    while let Ok(p) = consumer.pop() {
+                    while mixer.can_trigger() {
+                        let Ok(p) = consumer.pop() else { break };
                         mixer.trigger(p.sample, p.gain);
                     }
                     mixer.render(out, channels);
                 },
-                move |e| {
-                    eprintln!("audio stream error: {e}");
+                move |_e| {
                     err_flag.store(true, Ordering::Relaxed);
                 },
                 None,
@@ -92,6 +96,7 @@ impl AudioOutput {
             device_name: Some(device.to_string()),
             sample_rate: config.sample_rate,
             stats,
+            callbacks,
             requested,
             idle: IdleTimer::new(IDLE_TIMEOUT, Instant::now()),
             retired,
@@ -107,6 +112,11 @@ impl AudioOutput {
         )
     }
 
+    /// Diagnostics only: counts actual callbacks, including silent ones.
+    pub fn callback_count(&self) -> u32 {
+        self.callbacks.load(Ordering::Relaxed)
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -119,23 +129,30 @@ impl AudioOutput {
     /// Never blocks except for that resume; drops the sound if the ring is full.
     pub fn play(&mut self, sample: Arc<[f32]>, gain: f32) {
         self.free_retired();
+        if gain <= 0.0 {
+            return;
+        }
         if self.idle.on_activity(Instant::now())
             && let Err(e) = self._stream.play()
         {
             eprintln!("audio resume failed: {e}");
             self.errored.store(true, Ordering::Relaxed);
+            self.idle.force_pause();
+            return;
         }
         let _ = self.producer.push(Play { sample, gain });
     }
 
     /// Pause the stream after `IDLE_TIMEOUT` without sounds, so macOS can sleep.
-    pub fn pause_if_idle(&mut self) {
+    pub fn pause_if_idle(&mut self) -> Result<()> {
         self.free_retired();
         if self.idle.on_tick(Instant::now())
             && let Err(e) = self._stream.pause()
         {
-            eprintln!("audio pause failed: {e}");
+            self.idle.pause_failed();
+            return Err(e).context("pausing idle stream");
         }
+        Ok(())
     }
 
     fn free_retired(&mut self) {
@@ -161,7 +178,7 @@ impl AudioOutput {
         *self = AudioOutput::start()?;
         if was_paused {
             // Keep the new stream paused until the next sound.
-            let _ = self._stream.pause();
+            self._stream.pause().context("pausing rebuilt stream")?;
             self.idle.force_pause();
         }
         Ok(true)

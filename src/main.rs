@@ -12,7 +12,12 @@ fn main() -> anyhow::Result<()> {
         Command::Styles => commands::styles(),
         Command::Volume { level } => commands::volume(level),
         Command::Status => commands::status(),
-        Command::Probe => probe(),
+        Command::Probe {
+            acknowledge_key_logging: true,
+        } => probe(),
+        Command::Probe {
+            acknowledge_key_logging: false,
+        } => anyhow::bail!("explicit key-logging consent is required"),
         Command::Demo { style } => demo(&style),
         Command::Daemon { reexecs } => rustic_keys::daemon::run(reexecs),
         Command::CheckAccess => std::process::exit(if permission::check() == permission::Access::Granted {
@@ -59,15 +64,26 @@ fn demo(name: &str) -> anyhow::Result<()> {
 fn probe() -> anyhow::Result<()> {
     let access = permission::check();
     println!("permission: {access:?}");
-    if access != permission::Access::Granted && !permission::request() {
+    eprintln!(
+        "WARNING: probe prints key content from ALL keyboards. Use dummy text only. Do not type secrets or save/share output."
+    );
+    if access != permission::Access::Granted {
         println!(
             "Grant Input Monitoring to your terminal app in System Settings → Privacy & Security → Input Monitoring, then rerun."
         );
     }
-    let (tx, rx) = std::sync::mpsc::channel();
-    hid::spawn_listener(tx)?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(256);
+    let listener = hid::spawn_listener(tx)?;
     println!("listening — press Ctrl-C to stop");
-    for msg in rx {
+    while !listener.is_finished() {
+        if let Some(result) = listener.ready() {
+            result?;
+        }
+        let msg = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(msg) => msg,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => break,
+        };
         match msg {
             hid::InputMsg::Key(ev) => {
                 let src = match ev.source {
@@ -84,5 +100,5 @@ fn probe() -> anyhow::Result<()> {
             hid::InputMsg::DeviceSeen { info, source } => println!("device {source:?}: {info:?}"),
         }
     }
-    Ok(())
+    anyhow::bail!("keyboard listener exited")
 }

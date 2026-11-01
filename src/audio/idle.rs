@@ -36,6 +36,11 @@ impl IdleTimer {
         true
     }
 
+    /// A failed native pause must be retried on the next tick, without new input.
+    pub fn pause_failed(&mut self) {
+        self.paused = false;
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }
@@ -52,6 +57,16 @@ mod tests {
     use super::*;
 
     const T: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn failed_pause_retries_without_activity() {
+        let t0 = Instant::now();
+        let mut idle = IdleTimer::new(T, t0);
+        assert!(idle.on_tick(t0 + T));
+        idle.pause_failed();
+        assert!(!idle.is_paused());
+        assert!(idle.on_tick(t0 + T + Duration::from_secs(2)));
+    }
 
     #[test]
     fn pauses_once_after_timeout() {

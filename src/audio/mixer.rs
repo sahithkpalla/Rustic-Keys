@@ -38,15 +38,24 @@ impl Mixer {
         }
     }
 
+    /// Reserve one retirement slot before taking an incoming command. On
+    /// overload stop draining commands; never free a last Arc in the callback.
+    pub fn can_trigger(&self) -> bool {
+        self.retire.as_ref().is_none_or(|r| r.slots() > 0)
+    }
+
     fn release(&mut self, sample: Arc<[f32]>) {
         if let Some(r) = self.retire.as_mut() {
-            // If the ring is full the Arc drops here: a rare fallback.
-            let _ = r.push(sample);
+            // All call sites check capacity on this single producer first.
+            if let Err(rtrb::PushError::Full(_sample)) = r.push(sample) {
+                unreachable!("retirement capacity reserved by single audio producer");
+            }
         }
     }
 
     /// Start a voice; when all slots are busy the oldest voice is replaced.
     pub fn trigger(&mut self, sample: Arc<[f32]>, gain: f32) {
+        assert!(self.can_trigger(), "caller must reserve retirement capacity");
         if sample.is_empty() {
             self.release(sample);
             return;
@@ -75,9 +84,14 @@ impl Mixer {
             let mut acc = 0.0f32;
             for i in 0..MAX_VOICES {
                 let Some(v) = self.voices[i].as_mut() else { continue };
-                acc += v.sample[v.pos] * v.gain;
-                v.pos += 1;
+                if v.pos < v.sample.len() {
+                    acc += v.sample[v.pos] * v.gain;
+                    v.pos += 1;
+                }
+                // Completed voices retain their Arc silently until retirement
+                // has space. This is bounded by MAX_VOICES, even on overload.
                 if v.pos >= v.sample.len()
+                    && self.can_trigger()
                     && let Some(done) = self.voices[i].take()
                 {
                     self.release(done.sample);
@@ -97,6 +111,26 @@ impl Default for Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retirement_overload_retains_completed_voices_until_drained() {
+        let (tx, mut rx) = rtrb::RingBuffer::new(1);
+        let mut m = Mixer::with_retire(tx);
+        let first: Arc<[f32]> = Arc::from(vec![0.1f32]);
+        let second: Arc<[f32]> = Arc::from(vec![0.2f32]);
+        m.trigger(first.clone(), 1.0);
+        m.trigger(second.clone(), 1.0);
+        let mut out = [0.0; 2];
+        m.render(&mut out, 1);
+        assert!(!m.can_trigger());
+        assert_eq!(Arc::strong_count(&second), 2);
+        drop(rx.pop().unwrap());
+        assert!(m.can_trigger());
+        m.render(&mut out, 1);
+        assert_eq!(out, [0.0, 0.0]);
+        assert_eq!(rx.pop().unwrap().len(), 1);
+        assert_eq!(Arc::strong_count(&second), 1);
+    }
 
     #[test]
     fn finished_samples_are_handed_back_for_freeing() {

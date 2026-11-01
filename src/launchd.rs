@@ -75,20 +75,26 @@ pub fn needs_reinstall(installed: Option<&Path>, exe: &Path, exe_rebuilt_since_i
 }
 
 /// Compare the installed plist with the running binary (see `needs_reinstall`).
-pub fn installed_is_stale(exe: &Path) -> bool {
-    let path = plist_path();
-    let installed = std::fs::read_to_string(&path).ok().and_then(|x| installed_program(&x));
+pub fn installed_is_stale(exe: &Path) -> Result<bool> {
+    let path = plist_path()?;
+    let bytes = crate::state_files::PrivateDir::open(path.parent().unwrap())?.read(&format!("{LABEL}.plist"), 65536)?;
+    let installed = bytes
+        .and_then(|x| String::from_utf8(x).ok())
+        .and_then(|x| installed_program(&x));
     let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
     let rebuilt = matches!((modified(exe), modified(&path)), (Some(e), Some(p)) if e > p);
-    needs_reinstall(installed.as_deref(), exe, rebuilt)
+    Ok(needs_reinstall(installed.as_deref(), exe, rebuilt))
 }
 
 /// `~/Library/LaunchAgents/com.rustickeys.agent.plist`
-pub fn plist_path() -> PathBuf {
+pub fn plist_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    home.join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
+        .filter(|h| !h.is_empty())
+        .context("HOME is absent; cannot manage LaunchAgent")?;
+    anyhow::ensure!(Path::new(&home).is_absolute(), "HOME must be absolute");
+    Ok(PathBuf::from(home)
+        .join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist")))
 }
 
 fn domain() -> String {
@@ -96,27 +102,48 @@ fn domain() -> String {
 }
 
 fn launchctl(args: &[&str]) -> Result<std::process::Output> {
-    Command::new("launchctl")
-        .args(args)
-        .output()
+    crate::process::output(Command::new("launchctl").args(args), std::time::Duration::from_secs(2))
         .context("running launchctl")
 }
 
 /// Is the agent loaded in this login session?
-pub fn is_loaded() -> bool {
-    launchctl(&["print", &format!("{}/{LABEL}", domain())]).is_ok_and(|o| o.status.success())
+pub fn is_loaded() -> Result<bool> {
+    let out = launchctl(&["print", &format!("{}/{LABEL}", domain())])?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    // launchctl's specific service-not-found result, NOT every nonzero query.
+    // Unknown/localized errors are deliberately conservative and retain the plist.
+    let err = String::from_utf8_lossy(&out.stderr);
+    if out.status.code() == Some(113) && err.contains("Could not find service") {
+        return Ok(false);
+    }
+    bail!("launchctl query failed (state unknown): {}", err.trim())
 }
 
 /// Write the plist and load it; launchd starts the agent now and at every login.
 pub fn install(exe: &Path) -> Result<()> {
-    let path = plist_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let path = plist_path()?;
+    let home = crate::config::home_dir()?;
+    for p in [exe, home.as_path(), path.as_path()] {
+        let text = p.to_str().context("LaunchAgent paths must be UTF-8")?;
+        anyhow::ensure!(
+            !text
+                .chars()
+                .any(|c| (c.is_control() && !matches!(c, '\t' | '\n' | '\r')) || matches!(c, '\u{fffe}' | '\u{ffff}')),
+            "path contains invalid XML characters"
+        );
     }
-    let home = std::env::var_os("RUSTIC_KEYS_HOME").map(PathBuf::from);
-    std::fs::create_dir_all(crate::config::home_dir())?;
-    std::fs::write(&path, plist_xml(exe, &crate::config::log_path(), home.as_deref()))
-        .with_context(|| format!("writing {}", path.display()))?;
+    let dir = crate::state_files::PrivateDir::open(path.parent().unwrap())?;
+    let state = crate::state_files::PrivateDir::open(&home)?;
+    // launchd must never open an attacker-preplaced log link. The daemon owns
+    // its capped, no-follow log; launchd's inherited descriptors go to /dev/null.
+    let _ = state.open_file("agent.log", true, true)?;
+    dir.atomic_write(
+        &format!("{LABEL}.plist"),
+        plist_xml(exe, Path::new("/dev/null"), Some(&home)).as_bytes(),
+    )
+    .with_context(|| format!("writing {}", path.display()))?;
     let out = launchctl(&["bootstrap", &domain(), &path.to_string_lossy()])?;
     if !out.status.success() {
         bail!(
@@ -127,26 +154,33 @@ pub fn install(exe: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Unload the agent and delete the plist. Returns `false` if nothing was installed.
+/// Unload and positively verify absence. The caller removes the plist only
+/// after socket shutdown verification, retaining evidence on any failure.
 pub fn uninstall() -> Result<bool> {
-    let path = plist_path();
-    let loaded = is_loaded();
-    if !loaded && !path.exists() {
-        return Ok(false);
-    }
+    let path = plist_path()?;
+    let dir = crate::state_files::PrivateDir::open(path.parent().unwrap())?;
+    let existed = dir.read(&format!("{LABEL}.plist"), 65536)?.is_some();
+    let loaded = is_loaded()?;
     if loaded {
         let out = launchctl(&["bootout", &format!("{}/{LABEL}", domain())])?;
-        if !out.status.success() && is_loaded() {
+        if !out.status.success() {
             bail!(
-                "launchctl bootout failed: {}",
+                "launchctl bootout failed; plist retained: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
     }
-    if path.exists() {
-        std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-    }
-    Ok(true)
+    // Verify absence positively before deleting recovery evidence, even after a
+    // successful bootout. A silent socket is never proof of an unloaded job.
+    anyhow::ensure!(!is_loaded()?, "agent is still loaded; plist retained");
+    Ok(loaded || existed)
+}
+
+/// Called only after both launchd absence and socket shutdown are verified.
+pub fn remove_plist() -> Result<()> {
+    let path = plist_path()?;
+    crate::state_files::PrivateDir::open(path.parent().unwrap())?.remove(&format!("{LABEL}.plist"))?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -8,30 +8,32 @@ use serde::{Deserialize, Serialize};
 use crate::filter::{DEFAULT_MODE, Mode};
 
 /// `$RUSTIC_KEYS_HOME`, else `~/Library/Application Support/rustic-keys`.
-pub fn home_dir() -> PathBuf {
+pub fn home_dir() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("RUSTIC_KEYS_HOME").filter(|d| !d.is_empty()) {
-        return PathBuf::from(dir);
+        anyhow::ensure!(PathBuf::from(&dir).is_absolute(), "RUSTIC_KEYS_HOME must be absolute");
+        return Ok(PathBuf::from(dir));
     }
     let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join("Library/Application Support/rustic-keys")
+        .filter(|h| !h.is_empty())
+        .context("HOME is absent; set an absolute private RUSTIC_KEYS_HOME")?;
+    anyhow::ensure!(PathBuf::from(&home).is_absolute(), "HOME must be absolute");
+    Ok(PathBuf::from(home).join("Library/Application Support/rustic-keys"))
 }
 
-pub fn config_path() -> PathBuf {
-    home_dir().join("config.toml")
+pub fn config_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join("config.toml"))
+}
+pub fn socket_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join("agent.sock"))
+}
+pub fn log_path() -> Result<PathBuf> {
+    Ok(home_dir()?.join("agent.log"))
 }
 
-pub fn socket_path() -> PathBuf {
-    home_dir().join("agent.sock")
-}
-
-pub fn log_path() -> PathBuf {
-    home_dir().join("agent.log")
-}
+pub const MAX_CONFIG_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub style: String,
     pub volume: u8,
@@ -51,21 +53,29 @@ impl Default for Config {
 impl Config {
     /// Load settings; a missing file means defaults.
     pub fn load() -> Result<Config> {
-        let path = config_path();
-        match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("reading {}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-        }
+        let dir = crate::state_files::PrivateDir::open(&home_dir()?)?;
+        let Some(bytes) = dir.read("config.toml", MAX_CONFIG_BYTES)? else {
+            return Ok(Self::default());
+        };
+        let c: Self = toml::from_str(std::str::from_utf8(&bytes)?).context("reading config.toml")?;
+        c.validate()?;
+        Ok(c)
     }
 
     /// Save atomically (temp file + rename) so the agent never reads half a file.
     pub fn save(&self) -> Result<()> {
-        let dir = home_dir();
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let tmp = dir.join("config.toml.tmp");
-        std::fs::write(&tmp, toml::to_string(self)?)?;
-        std::fs::rename(&tmp, config_path())?;
+        self.validate()?;
+        crate::state_files::PrivateDir::open(&home_dir()?)?
+            .atomic_write("config.toml", toml::to_string(self)?.as_bytes())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.volume <= 100, "volume must be 0–100");
+        anyhow::ensure!(
+            crate::styles::find(&self.style).is_some(),
+            "unknown style in config: {:?}",
+            self.style
+        );
         Ok(())
     }
 }

@@ -40,11 +40,21 @@ impl Filter {
         }
     }
 
+    pub fn clear_held(&mut self) {
+        self.held.clear();
+    }
+
     pub fn set_mode(&mut self, mode: Mode) {
+        if self.mode != mode {
+            self.clear_held();
+        }
         self.mode = mode;
     }
 
     pub fn set_external_connected(&mut self, connected: bool) {
+        if self.external_connected != connected {
+            self.clear_held();
+        }
         self.external_connected = connected;
     }
 
