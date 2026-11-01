@@ -11,6 +11,8 @@ use crate::{launchd, styles};
 
 const PERMISSION_HELP: &str = "Rustic Keys needs Input Monitoring permission.
 Open System Settings → Privacy & Security → Input Monitoring and turn on \"rustic-keys\".
+If it's already on (common after reinstalling), remove it with − and add it again with +
+(press Cmd-Shift-G and enter ~/.cargo/bin/rustic-keys).
 It will start clicking automatically once allowed (no need to run start again).";
 
 fn validate_style(name: &str) -> Result<()> {
