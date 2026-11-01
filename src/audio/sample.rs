@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use crate::filter::Sound;
+use crate::styles::Style;
+
 /// Decode a WAV, downmix to mono, and linearly resample to `target_rate`.
 pub fn decode_wav(bytes: &[u8], target_rate: u32) -> Result<Arc<[f32]>> {
     let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).context("not a WAV file")?;
@@ -41,6 +44,30 @@ fn resample_linear(input: &[f32], from: u32, to: u32) -> Vec<f32> {
         .collect()
 }
 
+/// A style's samples decoded at the output rate.
+pub struct LoadedStyle {
+    pub press: Vec<Arc<[f32]>>,
+    pub release: Vec<Arc<[f32]>>,
+}
+
+pub fn load_style(s: &Style, rate: u32) -> Result<LoadedStyle> {
+    let decode = |set: &[&[u8]]| -> Result<Vec<Arc<[f32]>>> { set.iter().map(|b| decode_wav(b, rate)).collect() };
+    let loaded = LoadedStyle { press: decode(s.press)?, release: decode(s.release)? };
+    anyhow::ensure!(!loaded.press.is_empty() && !loaded.release.is_empty(), "style {} has no samples", s.name);
+    Ok(loaded)
+}
+
+impl LoadedStyle {
+    /// Variant `n % len` of the requested sound; callers rotate `n`.
+    pub fn pick(&self, sound: Sound, n: usize) -> Arc<[f32]> {
+        let set = match sound {
+            Sound::Press => &self.press,
+            Sound::Release => &self.release,
+        };
+        set[n % set.len()].clone()
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn wav_bytes(rate: u32, channels: u16, frames: &[i16]) -> Vec<u8> {
     let spec = hound::WavSpec { channels, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
@@ -71,6 +98,18 @@ mod tests {
         let out = decode_wav(&wav_bytes(48000, 2, &[16384, -16384]), 48000).unwrap();
         assert_eq!(out.len(), 1);
         assert!(out[0].abs() < 1e-3);
+    }
+
+    #[test]
+    fn pick_rotates_variants() {
+        let style = crate::styles::find("clicky").unwrap();
+        let loaded = load_style(style, 48000).unwrap();
+        let n = loaded.press.len();
+        assert!(n >= 2);
+        assert!(Arc::ptr_eq(&loaded.pick(Sound::Press, 0), &loaded.press[0]));
+        assert!(Arc::ptr_eq(&loaded.pick(Sound::Press, 1), &loaded.press[1]));
+        assert!(Arc::ptr_eq(&loaded.pick(Sound::Press, n), &loaded.press[0]));
+        assert!(Arc::ptr_eq(&loaded.pick(Sound::Release, 0), &loaded.release[0]));
     }
 
     #[test]
