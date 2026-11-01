@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Context, Result};
-use core_foundation::base::{CFType, TCFType};
+use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
@@ -32,15 +32,62 @@ pub enum InputMsg {
     DeviceSeen { info: DeviceInfo, source: KeySource },
 }
 
+/// Connected keyboards, keyed by IOHIDDevice pointer. Only the matching and
+/// removal callbacks change it, so a key value that arrives after its device
+/// was removed can never leave a stale entry behind.
+#[derive(Default)]
+pub struct DeviceRegistry {
+    devices: HashMap<usize, KeySource>,
+}
+
+impl DeviceRegistry {
+    pub fn matched(&mut self, id: usize, source: KeySource) {
+        self.devices.insert(id, source);
+    }
+
+    pub fn removed(&mut self, id: usize) {
+        self.devices.remove(&id);
+    }
+
+    pub fn source_of(&self, id: usize) -> Option<KeySource> {
+        self.devices.get(&id).copied()
+    }
+
+    /// (built-in, external)
+    pub fn counts(&self) -> (usize, usize) {
+        let builtin = self.devices.values().filter(|s| **s == KeySource::BuiltIn).count();
+        (builtin, self.devices.len() - builtin)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenOutcome {
+    Opened,
+    /// No Input Monitoring permission: nothing will be delivered.
+    NotPermitted,
+    /// Some device couldn't be opened (e.g. held exclusively elsewhere); the
+    /// others still deliver, so keep listening.
+    Partial,
+}
+
+const K_IO_RETURN_NOT_PERMITTED: i32 = 0xe00002e2u32 as i32;
+
+pub fn open_outcome(ret: IOReturn) -> OpenOutcome {
+    match ret {
+        0 => OpenOutcome::Opened,
+        K_IO_RETURN_NOT_PERMITTED => OpenOutcome::NotPermitted,
+        _ => OpenOutcome::Partial,
+    }
+}
+
 struct Ctx {
     tx: Sender<InputMsg>,
-    devices: HashMap<usize, KeySource>,
+    devices: DeviceRegistry,
 }
 
 impl Ctx {
     fn send_counts(&self) {
-        let builtin = self.devices.values().filter(|s| **s == KeySource::BuiltIn).count();
-        let external = self.devices.len() - builtin;
+        let (builtin, external) = self.devices.counts();
         let _ = self.tx.send(InputMsg::Devices { builtin, external });
     }
 }
@@ -72,7 +119,7 @@ unsafe extern "C" fn on_match(context: *mut c_void, _r: IOReturn, _s: *mut c_voi
     let info = device_info(device);
     let source = classify(&info);
     let mut c = ctx.borrow_mut();
-    c.devices.insert(device as usize, source);
+    c.devices.matched(device as usize, source);
     let _ = c.tx.send(InputMsg::DeviceSeen { info, source });
     c.send_counts();
 }
@@ -80,7 +127,7 @@ unsafe extern "C" fn on_match(context: *mut c_void, _r: IOReturn, _s: *mut c_voi
 unsafe extern "C" fn on_remove(context: *mut c_void, _r: IOReturn, _s: *mut c_void, device: IOHIDDeviceRef) {
     let ctx = unsafe { ctx(context) };
     let mut c = ctx.borrow_mut();
-    c.devices.remove(&(device as usize));
+    c.devices.removed(device as usize);
     c.send_counts();
 }
 
@@ -92,11 +139,8 @@ unsafe extern "C" fn on_value(context: *mut c_void, _r: IOReturn, _s: *mut c_voi
         return;
     }
     let device = unsafe { IOHIDElementGetDevice(element) };
-    let mut c = ctx.borrow_mut();
-    let source = *c
-        .devices
-        .entry(device as usize)
-        .or_insert_with(|| classify(&device_info(device)));
+    let c = ctx.borrow();
+    let source = c.devices.source_of(device as usize).unwrap_or_else(|| classify(&device_info(device)));
     let action = if unsafe { IOHIDValueGetIntegerValue(value) } != 0 { KeyAction::Down } else { KeyAction::Up };
     if std::env::var_os("RUSTIC_KEYS_TRACE").is_some() {
         trace_delivery(unsafe { IOHIDValueGetTimeStamp(value) });
@@ -123,12 +167,14 @@ pub fn spawn_listener(tx: Sender<InputMsg>) -> Result<JoinHandle<()>> {
     let handle = std::thread::Builder::new()
         .name("hid-listener".into())
         .spawn(move || {
-            // Leaked on purpose: lives as long as the run loop (the process).
-            let ctx: &'static RefCell<Ctx> = Box::leak(Box::new(RefCell::new(Ctx { tx, devices: HashMap::new() })));
-            let context = ctx as *const RefCell<Ctx> as *mut c_void;
+            // Owned by the run loop for the life of the process; freed only if
+            // opening fails below.
+            let ctx_ptr = Box::into_raw(Box::new(RefCell::new(Ctx { tx, devices: DeviceRegistry::default() })));
+            let context = ctx_ptr as *mut c_void;
             unsafe {
                 let manager = IOHIDManagerCreate(std::ptr::null(), kIOHIDManagerOptionNone);
                 if manager.is_null() {
+                    drop(Box::from_raw(ctx_ptr));
                     let _ = ready_tx.send(Err(anyhow!("IOHIDManagerCreate failed")));
                     return;
                 }
@@ -146,9 +192,23 @@ pub fn spawn_listener(tx: Sender<InputMsg>) -> Result<JoinHandle<()>> {
                     kCFRunLoopDefaultMode,
                 );
                 let ret = IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone);
-                if ret != 0 {
-                    let _ = ready_tx.send(Err(anyhow!("IOHIDManagerOpen failed: 0x{ret:08x}")));
-                    return;
+                match open_outcome(ret) {
+                    OpenOutcome::Opened => {}
+                    OpenOutcome::Partial => {
+                        eprintln!("[rustic-keys] some keyboards couldn't be opened (0x{ret:08x}); listening to the rest");
+                    }
+                    OpenOutcome::NotPermitted => {
+                        // Tear everything down so retries don't leak.
+                        IOHIDManagerUnscheduleFromRunLoop(
+                            manager,
+                            CFRunLoop::get_current().as_concrete_TypeRef(),
+                            kCFRunLoopDefaultMode,
+                        );
+                        CFRelease(manager as CFTypeRef);
+                        drop(Box::from_raw(ctx_ptr));
+                        let _ = ready_tx.send(Err(anyhow!("IOHIDManagerOpen: not permitted (0x{ret:08x})")));
+                        return;
+                    }
                 }
                 let _ = ready_tx.send(Ok(()));
                 CFRunLoop::run_current();
@@ -157,4 +217,34 @@ pub fn spawn_listener(tx: Sender<InputMsg>) -> Result<JoinHandle<()>> {
         .context("spawning HID listener thread")?;
     ready_rx.recv().context("HID listener thread exited early")??;
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_counts_matched_devices() {
+        let mut r = DeviceRegistry::default();
+        r.matched(1, KeySource::BuiltIn);
+        r.matched(2, KeySource::External);
+        assert_eq!(r.counts(), (1, 1));
+        r.removed(2);
+        assert_eq!(r.counts(), (1, 0));
+    }
+
+    #[test]
+    fn registry_lookup_of_unknown_device_does_not_register_it() {
+        let r = DeviceRegistry::default();
+        assert_eq!(r.source_of(7), None);
+        assert_eq!(r.counts(), (0, 0));
+    }
+
+    #[test]
+    fn open_outcome_classifies_iokit_results() {
+        assert_eq!(open_outcome(0), OpenOutcome::Opened);
+        assert_eq!(open_outcome(0xe00002e2u32 as i32), OpenOutcome::NotPermitted);
+        // Any other error: some device failed to open, the rest may still work.
+        assert_eq!(open_outcome(0xe00002c5u32 as i32), OpenOutcome::Partial);
+    }
 }
