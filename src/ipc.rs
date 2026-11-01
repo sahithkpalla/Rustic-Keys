@@ -7,7 +7,7 @@ use std::path::Path;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::filter::Mode;
@@ -38,12 +38,24 @@ pub enum Response {
     Error { message: String },
 }
 
+/// `bind` found a live agent already answering on the socket.
+#[derive(Debug)]
+pub struct AlreadyRunning(pub std::path::PathBuf);
+
+impl std::fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "another agent is already listening on {}", self.0.display())
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
 /// Bind the agent socket. A leftover socket file from a dead agent is
 /// replaced; if a live agent answers, binding fails.
 pub fn bind(path: &Path) -> Result<UnixListener> {
     if path.exists() {
         if UnixStream::connect(path).is_ok() {
-            bail!("another agent is already listening on {}", path.display());
+            return Err(AlreadyRunning(path.to_path_buf()).into());
         }
         std::fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
     }
@@ -145,6 +157,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.sock");
         serve(bind(&path).unwrap(), |_| Response::Ok);
-        assert!(bind(&path).is_err());
+        let err = bind(&path).unwrap_err();
+        assert!(err.downcast_ref::<AlreadyRunning>().is_some(), "{err:#}");
+    }
+
+    #[test]
+    fn bind_other_failures_are_not_already_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = dir.path().join("x".repeat(120)).join("a.sock");
+        let err = bind(&long).unwrap_err();
+        assert!(err.downcast_ref::<AlreadyRunning>().is_none(), "{err:#}");
     }
 }

@@ -157,11 +157,13 @@ fn style_or_default(name: &str) -> &'static Style {
 pub fn run() -> Result<()> {
     let listener = match ipc::bind(&config::socket_path()) {
         Ok(l) => l,
-        Err(e) => {
-            // Another agent is alive: exit cleanly so launchd doesn't spin.
+        Err(e) if e.downcast_ref::<ipc::AlreadyRunning>().is_some() => {
+            // Another agent is alive: exit cleanly so launchd doesn't respawn us.
             log(format!("not starting: {e:#}"));
             return Ok(());
         }
+        // Anything else is a real failure: exit non-zero so launchd retries.
+        Err(e) => return Err(e.context("binding the control socket")),
     };
     let config = Config::load().unwrap_or_else(|e| {
         log(format!("config unreadable ({e:#}); using defaults"));
