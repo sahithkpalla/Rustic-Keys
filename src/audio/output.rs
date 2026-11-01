@@ -4,11 +4,13 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, StreamConfig, SupportedBufferSize};
 
+use super::idle::{IdleTimer, IDLE_TIMEOUT};
 use super::mixer::Mixer;
 
 const RING_CAPACITY: usize = 256;
@@ -29,6 +31,7 @@ pub struct AudioOutput {
     /// (frames in last callback, callback→playback latency in µs)
     stats: Arc<(AtomicU32, AtomicU32)>,
     requested: String,
+    idle: IdleTimer,
 }
 
 impl AudioOutput {
@@ -81,6 +84,7 @@ impl AudioOutput {
             sample_rate: config.sample_rate,
             stats,
             requested,
+            idle: IdleTimer::new(IDLE_TIMEOUT, Instant::now()),
         })
     }
 
@@ -97,9 +101,29 @@ impl AudioOutput {
         self.device_name.clone()
     }
 
-    /// Queue a sound. Never blocks; drops the sound if the ring is full.
+    /// Queue a sound, resuming the stream first if it was idle-paused.
+    /// Never blocks except for that resume; drops the sound if the ring is full.
     pub fn play(&mut self, sample: Arc<[f32]>, gain: f32) {
+        if self.idle.on_activity(Instant::now()) {
+            if let Err(e) = self._stream.play() {
+                eprintln!("audio resume failed: {e}");
+                self.errored.store(true, Ordering::Relaxed);
+            }
+        }
         let _ = self.producer.push(Play { sample, gain });
+    }
+
+    /// Pause the stream after `IDLE_TIMEOUT` without sounds, so macOS can sleep.
+    pub fn pause_if_idle(&mut self) {
+        if self.idle.on_tick(Instant::now()) {
+            if let Err(e) = self._stream.pause() {
+                eprintln!("audio pause failed: {e}");
+            }
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.idle.is_paused()
     }
 
     /// Rebuild the stream if it errored or the default output device changed.
@@ -113,7 +137,13 @@ impl AudioOutput {
         if !errored && current == self.device_id {
             return Ok(false);
         }
+        let was_paused = self.is_paused();
         *self = AudioOutput::start()?;
+        if was_paused {
+            // Keep the new stream paused until the next sound.
+            let _ = self._stream.pause();
+            self.idle.force_pause();
+        }
         Ok(true)
     }
 }

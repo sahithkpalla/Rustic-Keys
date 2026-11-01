@@ -171,6 +171,9 @@ pub fn run() -> Result<()> {
                             .ok();
                     }
                 }
+                if let Some(o) = output.as_mut() {
+                    o.pause_if_idle();
+                }
                 // Input: start listening once permission is granted.
                 if !listening {
                     let access = permission::check();
