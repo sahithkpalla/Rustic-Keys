@@ -177,6 +177,15 @@ pub fn append_log(path: &Path, text: &[u8], max: u64) -> Result<()> {
     let dir = PrivateDir::open(path.parent().context("log has no parent")?)?;
     let file = path.file_name().and_then(|n| n.to_str()).context("invalid log path")?;
     let mut f = dir.open_file(file, true, true)?;
+    // Duplicate startup attempts can log alongside the live agent. Serialize
+    // trim+append on this inode without ever waiting behind another writer.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(());
+        }
+        return Err(e.into());
+    }
     let bytes = &text[..text.len().min(4096).min(max as usize)];
     if f.metadata()?.len().saturating_add(bytes.len() as u64) > max {
         f.set_len(0)?;
@@ -235,6 +244,26 @@ mod tests {
             std::fs::remove_file(&p).unwrap();
         }
     }
+    #[test]
+    fn concurrent_duplicate_log_writers_cannot_exceed_runtime_cap() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("agent.log");
+        append_log(&p, b"initial", 1024).unwrap();
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        append_log(&p, &[b'x'; 300], 1024).unwrap();
+                        assert!(std::fs::metadata(&p).unwrap().len() <= 1024);
+                    }
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+        assert!(outcomes.into_iter().all(|o| o.is_ok()));
+    }
+
     #[test]
     fn atomic_write_refuses_special_files_and_symlinked_parent() {
         let d = tempfile::tempdir().unwrap();
