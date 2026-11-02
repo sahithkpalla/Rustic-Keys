@@ -15,7 +15,7 @@ pub enum Mode {
     Presence,
 }
 
-/// Chosen by the detection spike (docs/spike-results.md).
+/// Chosen by the detection spike.
 pub const DEFAULT_MODE: Mode = Mode::PerKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
