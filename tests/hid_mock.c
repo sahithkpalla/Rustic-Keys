@@ -28,6 +28,8 @@ extern void *IOHIDElementGetDevice(void *);
 extern void *IOHIDDeviceGetProperty(void *, void *);
 extern long IOHIDValueGetIntegerValue(void *);
 extern uint64_t IOHIDValueGetTimeStamp(void *);
+// Fail-closed marker for the resource child before it can call any HID API.
+uint64_t rustic_keys_test_mock_marker(void) { return UINT64_C(0x524b544553544f4e); }
 static char fixture(void) { FILE *f=fopen(getenv("RK_MOCK_PERMISSION"),"r"); int c=f?fgetc(f):'D';if(f)fclose(f);return c; }
 static void record(const char *s) { FILE *f=fopen(getenv("RK_MOCK_LOG"),"a"); if(f){fprintf(f,"%s\n",s);fclose(f);} }
 static uint32_t check(uint32_t r) {

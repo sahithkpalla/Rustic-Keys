@@ -4,6 +4,7 @@ use crate::filter::Mode;
 use crate::input::permission::Access;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -43,7 +44,7 @@ pub enum Response {
 pub struct AlreadyRunning(pub std::path::PathBuf);
 impl std::fmt::Display for AlreadyRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "another agent is already listening on {}", self.0.display())
+        write!(f, "another agent is starting or listening on {}", self.0.display())
     }
 }
 impl std::error::Error for AlreadyRunning {}
@@ -149,8 +150,46 @@ fn connect(path: &Path, deadline: Instant) -> Result<UnixStream> {
     Ok(s)
 }
 
-pub fn bind(path: &Path) -> Result<UnixListener> {
-    let _dir = crate::state_files::PrivateDir::open(path.parent().context("socket has no parent")?)?;
+/// The startup lock lives exactly as long as the socket, including after it
+/// moves to the serving thread. Never unlink the lock file while an agent runs.
+#[derive(Debug)]
+pub struct BoundListener {
+    listener: UnixListener,
+    _startup_lock: File,
+}
+impl AsRawFd for BoundListener {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.listener.as_raw_fd()
+    }
+}
+impl BoundListener {
+    fn accept(&self) -> std::io::Result<(UnixStream, std::os::unix::net::SocketAddr)> {
+        self.listener.accept()
+    }
+}
+
+pub fn bind(path: &Path) -> Result<BoundListener> {
+    bind_inner(path, || {})
+}
+
+// The seam exposes the exact stale-check/unlink interleaving to a regression,
+// without any native service or input listener.
+fn bind_inner(path: &Path, after_stale_check: impl FnOnce()) -> Result<BoundListener> {
+    let dir = crate::state_files::PrivateDir::open(path.parent().context("socket has no parent")?)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("invalid socket filename")?;
+    let startup_lock = dir.open_file(&format!("{name}.lock"), true, true)?;
+    // Check+unlink cannot be atomic by pathname. Serialize cooperating starts
+    // and retain ownership for the full listening lifetime, not only bind().
+    if unsafe { libc::flock(startup_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            return Err(AlreadyRunning(path.into()).into());
+        }
+        return Err(e.into());
+    }
     if let Some(m) = socket_metadata(path)? {
         match connect(path, Instant::now() + Duration::from_millis(150)) {
             Ok(_) => return Err(AlreadyRunning(path.into()).into()),
@@ -163,6 +202,7 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
                     (m.dev(), m.ino()) == (now.dev(), now.ino()),
                     "socket changed during stale check"
                 );
+                after_stale_check();
                 std::fs::remove_file(path)?;
             }
             Err(e) => return Err(e.context("cannot prove existing socket stale")),
@@ -171,7 +211,10 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
     let l = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     l.set_nonblocking(true)?;
-    Ok(l)
+    Ok(BoundListener {
+        listener: l,
+        _startup_lock: startup_lock,
+    })
 }
 
 struct Peer {
@@ -211,7 +254,7 @@ fn read_frame(s: &mut UnixStream, bytes: &mut Vec<u8>, limit: usize) -> Result<b
 }
 /// The handler must itself be bounded; the daemon uses a bounded queue and a
 /// 100 ms reply wait. Saturation closes excess peers, without allocating tasks.
-pub fn serve(listener: UnixListener, mut handler: impl FnMut(Request) -> Response + Send + 'static) -> JoinHandle<()> {
+pub fn serve(listener: BoundListener, mut handler: impl FnMut(Request) -> Response + Send + 'static) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut peers: Vec<Peer> = Vec::with_capacity(MAX_PEERS);
         loop {
@@ -360,6 +403,49 @@ mod tests {
             Response::Ok
         );
         assert!(bind(&p).unwrap_err().downcast_ref::<AlreadyRunning>().is_some());
+    }
+    #[test]
+    fn concurrent_stale_replacement_cannot_unlink_a_new_live_listener() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let (checked_tx, checked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let other_path = path.clone();
+        let contender = std::thread::spawn(move || {
+            bind_inner(&other_path, || {
+                checked_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            })
+        });
+        checked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The first contender has checked the stale inode but not unlinked it.
+        // A racing start must not be able to replace it and then be unlinked.
+        let racing = bind(&path);
+        resume_tx.send(()).unwrap();
+        let paused = contender.join().unwrap();
+        assert_eq!(
+            usize::from(racing.is_ok()) + usize::from(paused.is_ok()),
+            1,
+            "two live listeners must never be created for one pathname"
+        );
+        assert!(UnixStream::connect(&path).is_ok());
+    }
+    #[test]
+    fn startup_lock_is_owned_and_released_with_listener() {
+        use std::os::unix::fs::symlink;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.sock");
+        let first = bind(&path).unwrap();
+        assert!(bind(&path).unwrap_err().downcast_ref::<AlreadyRunning>().is_some());
+        drop(first);
+        drop(bind(&path).unwrap());
+        std::fs::remove_file(d.path().join("a.sock.lock")).unwrap();
+        let victim = d.path().join("victim");
+        std::fs::write(&victim, b"KEEP").unwrap();
+        symlink(&victim, d.path().join("a.sock.lock")).unwrap();
+        assert!(bind(&path).is_err());
+        assert_eq!(std::fs::read(victim).unwrap(), b"KEEP");
     }
     #[test]
     fn stale_socket_and_malformed_path() {

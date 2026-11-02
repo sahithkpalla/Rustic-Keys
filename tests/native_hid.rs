@@ -125,6 +125,88 @@ impl Lab {
     }
 }
 #[test]
+fn listener_create_stop_drop_releases_resources_repeatedly() {
+    use rustic_keys::input::hid;
+    const NAME: &str = "listener_create_stop_drop_releases_resources_repeatedly";
+    if std::env::var_os("RK_LIFETIME_CHILD").is_some() {
+        // An accidentally inherited child flag must never start real HID.
+        // The parent also checks every actual dyld replacement on this binary.
+        let marker = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"rustic_keys_test_mock_marker".as_ptr()) };
+        assert!(!marker.is_null(), "missing native mock: refusing all HID calls");
+        let marker: unsafe extern "C" fn() -> u64 = unsafe { std::mem::transmute(marker) };
+        assert_eq!(unsafe { marker() }, 0x524b544553544f4e);
+        for _ in 0..20 {
+            let (tx, rx) = std::sync::mpsc::sync_channel(2);
+            let listener = hid::spawn_listener(tx).unwrap();
+            let end = Instant::now() + Duration::from_secs(2);
+            while listener.ready().is_none() && !listener.is_finished() {
+                assert!(Instant::now() < end);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            listener.stop();
+            while !listener.is_finished() {
+                assert!(Instant::now() < end);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            drop(listener);
+            assert!(
+                matches!(rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)),
+                "callback context must drop its sender"
+            );
+        }
+        return;
+    }
+    for flag in [None, Some("RK_MOCK_OPEN_FAIL"), Some("RK_MOCK_RETURN_LOOP")] {
+        let lab = Lab::new();
+        let make = || {
+            let mut c = Command::new(std::env::current_exe().unwrap());
+            c.env("DYLD_INSERT_LIBRARIES", &lab.lib)
+                .env("RK_MOCK_PERMISSION", lab.dir.path().join("permission"))
+                .env("RK_MOCK_LOG", lab.dir.path().join("native.log"))
+                .env_remove("RUSTIC_KEYS_TRACE");
+            c
+        };
+        // Verify the test executable too, before its child can reach any HID call.
+        let preflight = make()
+            .env("DYLD_PRINT_INTERPOSING", "1")
+            .arg("--list")
+            .output()
+            .unwrap();
+        assert!(preflight.status.success());
+        let text = String::from_utf8_lossy(&preflight.stderr);
+        for symbol in SYMBOLS {
+            assert!(
+                text.contains(&format!("has interposed '_{symbol}'")),
+                "missing {symbol}: refusing listener test"
+            );
+        }
+        let mut c = make();
+        c.args(["--exact", NAME, "--test-threads=1"])
+            .env("RK_LIFETIME_CHILD", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(flag) = flag {
+            c.env(flag, "1");
+        }
+        let mut process = MockProcess(c.spawn().unwrap());
+        let end = Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < end, "bounded native child exceeded deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success());
+        let log = lab.native_log();
+        for marker in ["create\n", "unschedule\n", "close\n", "release manager\n"] {
+            assert_eq!(log.matches(marker).count(), 20, "{flag:?}: {marker}");
+        }
+        assert!(!log.contains("FORBIDDEN") && !log.contains("request mocked"));
+    }
+}
+
+#[test]
 fn cached_grant_revoke_idle_regrant_has_no_duplicate_listener() {
     let l = Lab::new();
     let _p = l.spawn(Some("RK_MOCK_CACHE"));

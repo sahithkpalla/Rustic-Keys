@@ -1,7 +1,7 @@
-//! Real-time voice mixer. `render` runs on the audio thread: it never
-//! allocates, locks, or frees. Samples it is done with (finished or stolen
-//! voices) are handed back over a ring so their memory is released on the
-//! agent thread instead.
+//! Voice mixer. Production uses `with_retire`: render never allocates/locks,
+//! and finished/stolen samples retire to the agent thread, including overload.
+//! The no-retirement `new`/`default` convenience is for non-realtime use: it can
+//! free samples inline. Stream/closure teardown is native-host-managed.
 
 use std::sync::Arc;
 
@@ -111,6 +111,35 @@ impl Default for Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_retirement_stress_releases_every_sample() {
+        let (tx, mut rx) = rtrb::RingBuffer::new(2);
+        let mut mixer = Mixer::with_retire(tx);
+        let mut samples = Vec::new();
+        for n in 0..1024 {
+            while !mixer.can_trigger() {
+                drop(rx.pop().unwrap());
+            }
+            let sample: Arc<[f32]> = Arc::from(vec![0.01; n % 7 + 1]);
+            samples.push(Arc::downgrade(&sample));
+            mixer.trigger(sample, 0.5);
+            mixer.render(&mut [0.0; 32], 2);
+            if n % 3 == 0 {
+                while let Ok(retired) = rx.pop() {
+                    drop(retired);
+                }
+            }
+        }
+        drop(mixer);
+        while let Ok(retired) = rx.pop() {
+            drop(retired);
+        }
+        assert!(
+            samples.into_iter().all(|weak| weak.upgrade().is_none()),
+            "all 1024 buffers freed after owner teardown"
+        );
+    }
 
     #[test]
     fn retirement_overload_retains_completed_voices_until_drained() {
