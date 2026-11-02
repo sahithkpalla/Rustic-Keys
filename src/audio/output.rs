@@ -21,6 +21,19 @@ struct Play {
     gain: f32,
 }
 
+fn drain_commands(consumer: &mut rtrb::Consumer<Play>, mixer: &mut Mixer, mut after_command: impl FnMut()) {
+    // A bounded ring does not bound a loop when its producer refills it while
+    // we drain. Always leave time for rendering, even under continuous load.
+    for _ in 0..RING_CAPACITY {
+        if !mixer.can_trigger() {
+            break;
+        }
+        let Ok(p) = consumer.pop() else { break };
+        mixer.trigger(p.sample, p.gain);
+        after_command();
+    }
+}
+
 pub struct AudioOutput {
     _stream: cpal::Stream,
     producer: rtrb::Producer<Play>,
@@ -75,10 +88,7 @@ impl AudioOutput {
                     let lat = ts.playback.duration_since(ts.callback);
                     stats_cb.0.store((out.len() / channels) as u32, Ordering::Relaxed);
                     stats_cb.1.store(lat.as_micros() as u32, Ordering::Relaxed);
-                    while mixer.can_trigger() {
-                        let Ok(p) = consumer.pop() else { break };
-                        mixer.trigger(p.sample, p.gain);
-                    }
+                    drain_commands(&mut consumer, &mut mixer, || {});
                     mixer.render(out, channels);
                 },
                 move |_e| {
@@ -182,5 +192,48 @@ impl AudioOutput {
             self.idle.force_pause();
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn concurrent_replenishment_cannot_extend_callback_work_indefinitely() {
+        let (mut producer, mut consumer) = rtrb::RingBuffer::new(RING_CAPACITY);
+        let (retire_tx, mut retired) = rtrb::RingBuffer::new(RING_CAPACITY);
+        let mut mixer = Mixer::with_retire(retire_tx);
+        let sample: Arc<[f32]> = Arc::from(vec![0.0; 1]);
+        producer
+            .push(Play {
+                sample: sample.clone(),
+                gain: 1.0,
+            })
+            .unwrap_or_else(|_| panic!("empty queue"));
+        let mut handled = 0;
+        // Models the actor draining retirement and refilling after each pop.
+        // Stop the fixture after a finite 2x budget so the buggy loop is bounded.
+        drain_commands(&mut consumer, &mut mixer, || {
+            handled += 1;
+            while retired.pop().is_ok() {}
+            if handled <= 2 * RING_CAPACITY {
+                assert!(
+                    producer
+                        .push(Play {
+                            sample: sample.clone(),
+                            gain: 1.0
+                        })
+                        .is_ok()
+                );
+            }
+        });
+        assert_eq!(
+            handled, RING_CAPACITY,
+            "concurrent refilling must not extend the per-callback budget"
+        );
+        assert_eq!(consumer.slots(), 1, "new work remains queued for a later callback");
+        let mut out = [1.0; 4];
+        mixer.render(&mut out, 1);
+        assert_eq!(out, [0.0; 4], "render still runs after bounded command work");
     }
 }
