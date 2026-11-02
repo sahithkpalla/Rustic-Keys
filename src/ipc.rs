@@ -432,6 +432,19 @@ mod tests {
         assert!(UnixStream::connect(&path).is_ok());
     }
     #[test]
+    fn serving_thread_retains_startup_ownership() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("a.sock");
+        serve(bind(&path).unwrap(), |_| Response::Ok);
+        let dir = crate::state_files::PrivateDir::open(d.path()).unwrap();
+        let lock = dir.open_file("a.sock.lock", true, false).unwrap();
+        assert_ne!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
+    }
+    #[test]
     fn startup_lock_is_owned_and_released_with_listener() {
         use std::os::unix::fs::symlink;
         let d = tempfile::tempdir().unwrap();
